@@ -31,6 +31,44 @@ TOKEN = None
 PER_PAGE = 100
 TOTAL_RECORDS_NEEDED = 500
 
+gallery_cache = {}
+
+def cargar_cache_galeria():
+    """
+    Carga la caché de la galería mapeando originalFilename a metadata.
+    """
+    global TOKEN, gallery_cache
+    if not TOKEN:
+        if not obtener_nuevo_token():
+            print("Error: No se pudo obtener un token para la galería.")
+            return False
+
+    gallery_url = "https://dashboard-api.verifyfaces.com/companies/54/galleries/531"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    params = {"perPage": 100, "page": 1} # Ajusta la paginación si es necesario
+
+    try:
+        print("Cargando datos de la galería para crear el caché...")
+        response = requests.get(gallery_url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Limpia el caché para asegurarte de que no haya datos antiguos
+        gallery_cache.clear()
+        
+        # Recorre las imágenes de la respuesta y crea el mapeo
+        for image_data in data.get("images", []):
+            original_filename = image_data.get("originalFilename")
+            metadata = image_data.get("metadata")
+            
+            if original_filename and metadata:
+                gallery_cache[original_filename] = metadata
+                
+        print(f"Caché de galería cargado con {len(gallery_cache)} entradas.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Error al cargar la caché de la galería: {e}")
+        return False
 
 def leer_csv(ruta: Path):
     registros = []
@@ -45,7 +83,7 @@ def leer_csv(ruta: Path):
         reader = csv.DictReader(f)
         for row in reader:
             fecha = str(row.get("fecha", "")).strip()
-            person_id = str(row.get("person_id", "")).strip()
+            person_id = str(row.get("nombre_persona", "")).strip()
             try:
                 conteo = int(row.get("conteo", "1"))
             except ValueError:
@@ -227,13 +265,13 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
     </div>
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Top 10)</h2></div>
-      <canvas id="top10Chart" height="100"></canvas>
-    </div>
-
-    <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Detecciones por person_id (Top 10)</h2></div>
       <canvas id="personasChart" height="100"></canvas>
+    </div>
+    
+    <div class="section">
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Top 10)</h2></div>
+      <canvas id="top10Chart" height="100"></canvas>
     </div>
 
     <div class="section">
@@ -441,8 +479,11 @@ def obtener_nuevo_token():
         return False
 
 @app.route('/')
+
+
+
 def mostrar_detecciones():
-    global fecha_ultimo_check, TOKEN
+    global fecha_ultimo_check, TOKEN, gallery_cache
     
     # Obtener el número de registros desde la URL, si no, usar el valor predeterminado
     try:
@@ -453,9 +494,13 @@ def mostrar_detecciones():
     if total_records_needed < PER_PAGE:
         total_records_needed = PER_PAGE
     
-    if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or TOKEN is None:
+    if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or not TOKEN:
         if not obtener_nuevo_token():
             return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
+        
+        # Nuevo paso: Cargar el caché de la galería
+        if not cargar_cache_galeria():
+            return "<h1>Error de la API</h1><p>No se pudieron obtener los datos de la galería.</p>", 500
         
         all_searches = []
         headers = {"Authorization": f"Bearer {TOKEN}"}
@@ -483,23 +528,29 @@ def mostrar_detecciones():
                 if len(searches_on_page) < PER_PAGE:
                     break
 
-            # Asegurarse de no exceder el límite solicitado
             all_searches = all_searches[:total_records_needed]
             
             print(f"Total de registros obtenidos: {len(all_searches)}")
             
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["fecha", "person_id", "conteo"])
+                writer.writerow(["fecha", "nombre_persona", "conteo"])
 
                 for search in all_searches:
-                    if not search.get("result"):
+                    if not search.get("payload") or not search["payload"].get("image"):
                         continue
-                    person_id = search["result"]["image"]["personId"]
+                    
+                    # Usa el originalFilename como clave
+                    original_filename = search["payload"]["image"].get("originalFilename")
                     timestamp = search["result"]["image"]["time"]
+                    
+                    # Busca el nombre en el caché de la galería
+                    metadata = gallery_cache.get(original_filename, {})
+                    person_name = metadata.get("name", "Nombre Desconocido")
+                    
                     try:
                         fecha = datetime.strptime(timestamp[:8], "%Y%m%d").date()
-                        writer.writerow([fecha, person_id, 1])
+                        writer.writerow([fecha, person_name, 1])
                     except (ValueError, IndexError):
                         continue
             
@@ -509,7 +560,7 @@ def mostrar_detecciones():
             if e.response.status_code == 401:
                 print("Token expirado. Intentando obtener uno nuevo...")
                 TOKEN = None
-                return redirect(url_for('mostrar_detecciones'))
+                return redirect(url_for('mostrar_detecciones', records=total_records_needed))
             else:
                 error_message = f"Error de la API: {e}"
                 return f"<h1>Error</h1><p>{error_message}</p>", 500
@@ -518,12 +569,42 @@ def mostrar_detecciones():
             return f"<h1>Error</h1><p>{error_message}</p>", 500
         except Exception as e:
             error_message = f"Ocurrió un error inesperado: {e}"
-            return f"<h1>Error</h1><p>{error_message}</p>", 500       
+            return f"<h1>Error</h1><p>{error_message}</p>", 500     
             
     registros, agg, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
     html_dashboard = construir_html(registros, agg, fechas_ordenadas, personas_ordenadas, personas_total, total_records_needed)
     
     return render_template_string(html_dashboard)
 
+def obtener_imagenes_galeria():
+    global TOKEN
+    
+    if not TOKEN:
+        if not obtener_nuevo_token():
+            print("Error: No se pudo obtener un token de autenticación.")
+            return
+
+    gallery_url = "https://dashboard-api.verifyfaces.com/companies/54/galleries/531"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    params = {"perPage": 100, "page": 1}
+
+    try:
+        print("Haciendo llamada a la API de la galería...")
+        response = requests.get(gallery_url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+
+        data = response.json()
+        print("Respuesta de la API de la galería:")
+        print(json.dumps(data, indent=2))
+        
+    except requests.exceptions.HTTPError as e:
+        print(f"Error HTTP al obtener imágenes: {e.response.status_code} - {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error de conexión al obtener imágenes: {e}")
+    except Exception as e:
+        print(f"Ocurrió un error inesperado: {e}")
+
+
 if __name__ == '__main__':
+    obtener_imagenes_galeria()
     app.run(debug=True)
