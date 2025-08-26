@@ -1,11 +1,14 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, redirect, url_for, request
 import requests
-from collections import defaultdict, Counter, OrderedDict
+from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 import csv
 import os
 from pathlib import Path
 import time
+import math
+import json
+import random
 
 # Crea una instancia de la aplicación Flask.
 app = Flask(__name__)
@@ -18,7 +21,6 @@ CSV_FILE = Path("detecciones_server.csv")
 
 # --- Configuración del API ---
 API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
-PER_PAGE = 100
 
 # --- Credenciales de autenticación ---
 AUTH_URL = "https://dashboard-api.verifyfaces.com/auth/login"
@@ -27,6 +29,7 @@ AUTH_PASSWORD = "Scarling//07052022.?"
 
 TOKEN = None
 PER_PAGE = 100
+TOTAL_RECORDS_NEEDED = 500
 
 
 def leer_csv(ruta: Path):
@@ -77,7 +80,7 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
-def construir_html(registros, agg, fechas, personas, personas_total):
+def construir_html(registros, agg, fechas, personas, personas_total, total_records_needed):
     """HTML completo del dashboard."""
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_fechas = len(set(r["fecha"] for r in registros)) if registros else 0
@@ -122,7 +125,38 @@ def construir_html(registros, agg, fechas, personas, personas_total):
         f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
         for pid, cnt in top_personas
     )
+    
+    # Función para generar colores aleatorios para los datasets de los gráficos
+    def generate_random_color():
+        r = lambda: random.randint(0,255)
+        return f'rgba({r()},{r()},{r()},.7)'
 
+    # Genera los datasets para el gráfico apilado de TODAS las personas
+    datasets_all = []
+    for person_id in personas:
+        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas]
+        datasets_all.append({
+            'label': html_escape(person_id),
+            'data': person_data,
+            'backgroundColor': generate_random_color(),
+            'stack': 'Stack 1'
+        })
+    datasets_all_json = json.dumps(datasets_all)
+    
+    # Genera los datasets para el gráfico apilado del TOP 10 de personas
+    datasets_top10 = []
+    top_10_ids = [pid for pid, _ in top_personas]
+    for person_id in top_10_ids:
+        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas]
+        datasets_top10.append({
+            'label': html_escape(person_id),
+            'data': person_data,
+            'backgroundColor': generate_random_color(),
+            'stack': 'Stack 1'
+        })
+    datasets_top10_json = json.dumps(datasets_top10)
+
+    
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -179,8 +213,22 @@ def construir_html(registros, agg, fechas, personas, personas_total):
     </div>
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por fecha</h2></div>
+      <div class="toolbar">
+        <h2 style="margin-right:auto">Detecciones (últimos {total_records_needed} registros)</h2>
+        <label for="num_registros" class="hint">Mostrar:</label>
+        <input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;">
+      </div>
       <canvas id="deteccionesChart" height="100"></canvas>
+    </div>
+
+    <div class="section">
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Todas)</h2></div>
+      <canvas id="allPersonsChart" height="100"></canvas>
+    </div>
+
+    <div class="section">
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Top 10)</h2></div>
+      <canvas id="top10Chart" height="100"></canvas>
     </div>
 
     <div class="section">
@@ -243,7 +291,7 @@ def construir_html(registros, agg, fechas, personas, personas_total):
         tr.style.display = txt.includes(q) ? '' : 'none';
       }}
     }});
-  }})(); // <--- CORRECCIÓN
+  }})( );
 
   // Filtro simple tabla pivot
   (function() {{
@@ -256,9 +304,14 @@ def construir_html(registros, agg, fechas, personas, personas_total):
         tr.style.display = firstCell.includes(q) ? '' : 'none';
       }}
     }});
-  }})(); // <--- CORRECCIÓN
+  }})( );
+  
+  // Refrescar página al cambiar el número de registros
+  document.getElementById('num_registros').addEventListener('change', function() {{
+      window.location.href = '/?records=' + this.value;
+  }});
 
-  // Gráfico de barras por fecha
+  // Gráfico de barras por fecha (total)
   (function() {{
     const ctx = document.getElementById('deteccionesChart').getContext('2d');
     new Chart(ctx, {{
@@ -283,9 +336,55 @@ def construir_html(registros, agg, fechas, personas, personas_total):
         }}
       }}
     }});
-  }})(); // <--- CORRECCIÓN
+  }})( );
 
-  // Gráfico de barras por person_id
+  // Gráfico de barras apiladas de TODAS las personas
+  (function() {{
+    const ctx = document.getElementById('allPersonsChart').getContext('2d');
+    new Chart(ctx, {{
+      type: 'bar',
+      data: {{
+        labels: {labels_chart},
+        datasets: {datasets_all_json}
+      }},
+      options: {{
+        responsive: true,
+        scales: {{
+          x: {{ stacked: true }},
+          y: {{
+            stacked: true,
+            beginAtZero: true,
+            ticks: {{ precision:0 }}
+          }}
+        }}
+      }}
+    }});
+  }})( );
+
+  // Gráfico de barras apiladas del TOP 10 de personas
+  (function() {{
+    const ctx = document.getElementById('top10Chart').getContext('2d');
+    new Chart(ctx, {{
+      type: 'bar',
+      data: {{
+        labels: {labels_chart},
+        datasets: {datasets_top10_json}
+      }},
+      options: {{
+        responsive: true,
+        scales: {{
+          x: {{ stacked: true }},
+          y: {{
+            stacked: true,
+            beginAtZero: true,
+            ticks: {{ precision:0 }}
+          }}
+        }}
+      }}
+    }});
+  }})( );
+
+  // Gráfico de barras por person_id (Top 10)
   (function() {{
     const ctx2 = document.getElementById('personasChart').getContext('2d');
     new Chart(ctx2, {{
@@ -311,7 +410,7 @@ def construir_html(registros, agg, fechas, personas, personas_total):
         }}
       }}
     }});
-  }})(); // <--- CORRECCIÓN
+  }})( );
 </script>
 </body>
 </html>
@@ -343,39 +442,57 @@ def obtener_nuevo_token():
 
 @app.route('/')
 def mostrar_detecciones():
-
     global fecha_ultimo_check, TOKEN
     
-    # Comprobar si ha pasado al menos un minuto o si el token es nulo
+    # Obtener el número de registros desde la URL, si no, usar el valor predeterminado
+    try:
+        total_records_needed = int(request.args.get('records', TOTAL_RECORDS_NEEDED))
+    except (ValueError, TypeError):
+        total_records_needed = TOTAL_RECORDS_NEEDED
+
+    if total_records_needed < PER_PAGE:
+        total_records_needed = PER_PAGE
+    
     if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or TOKEN is None:
         if not obtener_nuevo_token():
-            # Si la autenticación falla se muestra un error
             return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
-    
+        
+        all_searches = []
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        
         try:
-            from_str = (datetime.now() - timedelta(days=1)).strftime("2025-08-01T00:00:00.000Z")
+            from_str = (datetime.now() - timedelta(days=1)).strftime("2025-07-01T00:00:00.000Z")
             to_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-            params = {
-                "from": from_str,
-                "to": to_str,
-                "page": 1,
-                "perPage": PER_PAGE
-            }
-            headers = {"Authorization": f"Bearer {TOKEN}"}
             
-            response = requests.get(API_URL, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
+            num_pages = math.ceil(total_records_needed / PER_PAGE)
+            
+            for page_num in range(1, num_pages + 1):
+                params = {
+                    "from": from_str,
+                    "to": to_str,
+                    "page": page_num,
+                    "perPage": PER_PAGE
+                }
+                response = requests.get(API_URL, headers=headers, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                searches_on_page = data.get("searches", [])
+                all_searches.extend(searches_on_page)
+                
+                if len(searches_on_page) < PER_PAGE:
+                    break
 
-            data = response.json()
-            print(data)
-
-            # Guardar en CSV
+            # Asegurarse de no exceder el límite solicitado
+            all_searches = all_searches[:total_records_needed]
+            
+            print(f"Total de registros obtenidos: {len(all_searches)}")
+            
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["fecha", "person_id", "conteo"])
 
-                for search in data.get("searches", []):
+                for search in all_searches:
                     if not search.get("result"):
                         continue
                     person_id = search["result"]["image"]["personId"]
@@ -391,7 +508,6 @@ def mostrar_detecciones():
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 print("Token expirado. Intentando obtener uno nuevo...")
-                # Si el token expira se fuerza la obtención de uno nuevo en la siguiente carga
                 TOKEN = None
                 return redirect(url_for('mostrar_detecciones'))
             else:
@@ -402,11 +518,10 @@ def mostrar_detecciones():
             return f"<h1>Error</h1><p>{error_message}</p>", 500
         except Exception as e:
             error_message = f"Ocurrió un error inesperado: {e}"
-            return f"<h1>Error</h1><p>{error_message}</p>", 500      
-              
-    # Leer el CSV y construir el dashboard.
+            return f"<h1>Error</h1><p>{error_message}</p>", 500       
+            
     registros, agg, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
-    html_dashboard = construir_html(registros, agg, fechas_ordenadas, personas_ordenadas, personas_total)
+    html_dashboard = construir_html(registros, agg, fechas_ordenadas, personas_ordenadas, personas_total, total_records_needed)
     
     return render_template_string(html_dashboard)
 
