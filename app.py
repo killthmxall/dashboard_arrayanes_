@@ -136,7 +136,7 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
     data_personas = [cnt for _, cnt in top_personas]
 
     filas_agg = []
-    for (fecha, person_id), suma in sorted(agg.items(), key=lambda x: (x[0][0], -x[1])):
+    for (fecha, person_id), suma in sorted(agg.items(), key=lambda x: (x[0][0], -x[1]), reverse=True):
         filas_agg.append(
             f"<tr>"
             f"<td class='td'>{html_escape(fecha)}</td>"
@@ -150,10 +150,12 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
         if person_id in pivot and fecha in pivot[person_id]:
             pivot[person_id][fecha] += suma
 
-    th_fechas = "".join(f"<th class='th'>{html_escape(f)}</th>" for f in fechas)
+    fechas_ordenadas = sorted(fechas, reverse=True)
+
+    th_fechas = "".join(f"<th class='th'>{html_escape(f)}</th>" for f in fechas_ordenadas)
     filas_pivot = []
     for pid in personas:
-        celdas = "".join(f"<td class='td num'>{pivot[pid][f]}</td>" for f in fechas)
+        celdas = "".join(f"<td class='td num'>{pivot[pid][f]}</td>" for f in fechas_ordenadas)
         filas_pivot.append(
             f"<tr><td class='td mono'>{html_escape(pid)}</td>{celdas}"
             f"<td class='td num strong'>{sum(pivot[pid].values())}</td></tr>"
@@ -243,7 +245,7 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
 </head>
 <body>
   <div class="wrap">
-    <h1>Dashboard de detecciones Arrayanes</h1>
+    <span><img src="https://res.cloudinary.com/df5olfhrq/image/upload/v1756228647/logo_tpskcd.png" alt="BlockSecurity" style="height:80px; margin-bottom:16px;"></span> <span style="padding: 5px"> <img src="https://arrayanes.com/wp-content/uploads/2025/05/LOGO-ARRAYANES-1024x653.webp" alt="Arrayanes" style="height:80px; margin-bottom:16px;"><h1>Dashboard de detecciones Arrayanes Country Club</h1>
     <div class="grid cards">
       <div class="card"><h3>Registros totales</h3><div class="val">{total_registros}</div></div>
       <div class="card"><h3>Fechas únicas</h3><div class="val">{total_fechas}</div></div>
@@ -252,20 +254,15 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
 
     <div class="section">
       <div class="toolbar">
-        <h2 style="margin-right:auto">Detecciones (últimos {total_records_needed} registros)</h2>
+        <h2 style="margin-right:auto">Detecciones por persona y fecha (últimos {total_records_needed} registros)</h2>
         <label for="num_registros" class="hint">Mostrar:</label>
         <input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;">
       </div>
-      <canvas id="deteccionesChart" height="100"></canvas>
-    </div>
-
-    <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Todas)</h2></div>
       <canvas id="allPersonsChart" height="100"></canvas>
     </div>
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por person_id (Top 10)</h2></div>
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10)</h2></div>
       <canvas id="personasChart" height="100"></canvas>
     </div>
     
@@ -283,13 +280,13 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
 
     <div class="section">
       <div class="toolbar">
-        <h2 style="margin-right:auto">Tabla de detecciones (fecha · person_id · conteo)</h2>
-        <input class="input" id="filterAgg" placeholder="Filtra por fecha o person_id...">
+        <h2 style="margin-right:auto">Tabla de detecciones (fecha · nombre · conteo)</h2>
+        <input class="input" id="filterAgg" placeholder="Filtra por fecha o nombre...">
       </div>
       <div class="table-wrap">
         <table id="aggTable">
           <thead>
-            <tr><th class="th">fecha</th><th class="th">person_id</th><th class="th right">conteo</th></tr>
+            <tr><th class="th">fecha</th><th class="th">nombre</th><th class="th right">conteo</th></tr>
           </thead>
           <tbody>{''.join(filas_agg)}</tbody>
         </table>
@@ -299,8 +296,8 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
 
     <div class="section">
       <div class="toolbar">
-        <h2 style="margin-right:auto">Tabla de detecciones (person_id × fecha)</h2>
-        <input class="input" id="filterPivot" placeholder="Filtra por person_id...">
+        <h2 style="margin-right:auto">Tabla de detecciones (nombre × fecha)</h2>
+        <input class="input" id="filterPivot" placeholder="Filtra por nombre...">
       </div>
       <div class="table-wrap">
         <table id="pivotTable">
@@ -313,7 +310,7 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
       <div class="hint">Cada celda muestra la suma de <code>conteo</code> para ese <code>person_id</code> en la fecha correspondiente.</div>
     </div>
 
-    <div class="footer">Fuente: {html_escape(CSV_FILE.name)} · Generado {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+    <div class="footer">Generado {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
   </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -349,32 +346,6 @@ def construir_html(registros, agg, fechas, personas, personas_total, total_recor
       window.location.href = '/?records=' + this.value;
   }});
 
-  // Gráfico de barras por fecha (total)
-  (function() {{
-    const ctx = document.getElementById('deteccionesChart').getContext('2d');
-    new Chart(ctx, {{
-      type: 'bar',
-      data: {{
-        labels: {labels_chart},
-        datasets: [{{
-          label: 'Detecciones',
-          data: {data_chart},
-          backgroundColor: 'rgba(106, 167, 255, 0.7)',
-          borderColor: 'rgba(106, 167, 255, 1)',
-          borderWidth: 1
-        }}]
-      }},
-      options: {{
-        responsive: true,
-        scales: {{
-          y: {{
-            beginAtZero: true,
-            ticks: {{ precision:0 }}
-          }}
-        }}
-      }}
-    }});
-  }})( );
 
   // Gráfico de barras apiladas de TODAS las personas
   (function() {{
@@ -595,7 +566,6 @@ def obtener_imagenes_galeria():
 
         data = response.json()
         print("Respuesta de la API de la galería:")
-        print(json.dumps(data, indent=2))
         
     except requests.exceptions.HTTPError as e:
         print(f"Error HTTP al obtener imágenes: {e.response.status_code} - {e.response.text}")
