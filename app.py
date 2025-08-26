@@ -16,7 +16,7 @@ detecciones = defaultdict(lambda: defaultdict(int))
 fecha_ultimo_check = datetime.now() - timedelta(minutes=2)
 CSV_FILE = Path("detecciones_server.csv")
 
-# --- Configuración del API (Mover a variables de entorno en producción) ---
+# --- Configuración del API ---
 API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
 PER_PAGE = 100
 
@@ -68,7 +68,6 @@ def leer_csv(ruta: Path):
     return registros, agg, fechas_ordenadas, personas_ordenadas, personas_total
 
 def html_escape(s: str) -> str:
-    """Escapa caracteres HTML."""
     return (
         str(s)
         .replace("&", "&amp;")
@@ -79,7 +78,7 @@ def html_escape(s: str) -> str:
     )
 
 def construir_html(registros, agg, fechas, personas, personas_total):
-    """Construye el HTML completo del dashboard."""
+    """HTML completo del dashboard."""
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_fechas = len(set(r["fecha"] for r in registros)) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
@@ -319,9 +318,8 @@ def construir_html(registros, agg, fechas, personas, personas_total):
 """
 
 def obtener_nuevo_token():
-    """
-    Se conecta a la API de autenticación y actualiza el token global.
-    """
+    """ Se conecta a la API de autenticación y actualiza el token global."""
+
     global TOKEN
     try:
         # Petición POST con los datos de autenticación
@@ -343,7 +341,6 @@ def obtener_nuevo_token():
         print(f"Error al obtener el token: {e}")
         return False
 
-# --- Nueva ruta para las detecciones de la API ---
 @app.route('/')
 def mostrar_detecciones():
 
@@ -352,7 +349,7 @@ def mostrar_detecciones():
     # Comprobar si ha pasado al menos un minuto o si el token es nulo
     if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or TOKEN is None:
         if not obtener_nuevo_token():
-            # Si la autenticación falla, mostramos un error
+            # Si la autenticación falla se muestra un error
             return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
     
         try:
@@ -367,7 +364,6 @@ def mostrar_detecciones():
             }
             headers = {"Authorization": f"Bearer {TOKEN}"}
             
-            # Usar un tiempo de espera para evitar bloqueos
             response = requests.get(API_URL, headers=headers, params=params, timeout=10)
             response.raise_for_status()
 
@@ -380,7 +376,6 @@ def mostrar_detecciones():
                 writer.writerow(["fecha", "person_id", "conteo"])
 
                 for search in data.get("searches", []):
-                    # El campo result puede ser None
                     if not search.get("result"):
                         continue
                     person_id = search["result"]["image"]["personId"]
@@ -389,7 +384,6 @@ def mostrar_detecciones():
                         fecha = datetime.strptime(timestamp[:8], "%Y%m%d").date()
                         writer.writerow([fecha, person_id, 1])
                     except (ValueError, IndexError):
-                        # Ignora filas con timestamp inválido
                         continue
             
             fecha_ultimo_check = datetime.now()
@@ -397,7 +391,7 @@ def mostrar_detecciones():
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 print("Token expirado. Intentando obtener uno nuevo...")
-                # Si el token expira, forzamos la obtención de uno nuevo en la siguiente carga
+                # Si el token expira se fuerza la obtención de uno nuevo en la siguiente carga
                 TOKEN = None
                 return redirect(url_for('mostrar_detecciones'))
             else:
@@ -410,15 +404,11 @@ def mostrar_detecciones():
             error_message = f"Ocurrió un error inesperado: {e}"
             return f"<h1>Error</h1><p>{error_message}</p>", 500      
               
-    # Leer el CSV (ya sea actualizado o el existente) y construir el dashboard.
+    # Leer el CSV y construir el dashboard.
     registros, agg, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
     html_dashboard = construir_html(registros, agg, fechas_ordenadas, personas_ordenadas, personas_total)
     
     return render_template_string(html_dashboard)
 
-
-# Esta parte del código se asegura de que la aplicación solo se ejecute
-# cuando el script es el programa principal.
 if __name__ == '__main__':
-    # Ejecuta el servidor de desarrollo de Flask en modo de depuración.
     app.run(debug=True)
