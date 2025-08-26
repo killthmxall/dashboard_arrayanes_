@@ -11,41 +11,25 @@ import time
 app = Flask(__name__)
 
 # --- Variables Globales para el Conteo de Detecciones ---
-# En una aplicación real, esto se manejaría con una base de datos o caché.
-# Para este ejemplo, usamos variables globales para mantener el estado entre peticiones.
+
 detecciones = defaultdict(lambda: defaultdict(int))
-fecha_ultimo_check = datetime.now() - timedelta(minutes=2) # Inicializa para forzar la primera llamada
+fecha_ultimo_check = datetime.now() - timedelta(minutes=2)
 CSV_FILE = Path("detecciones_server.csv")
 
 # --- Configuración del API (Mover a variables de entorno en producción) ---
 API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
-# Nota: La clave de API es un dato sensible. En una aplicación real, no debe estar
-# hardcodeada. Se recomienda usar variables de entorno.
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjE4NCwiaWF0IjoxNzU2MTUxOTU2LCJleHAiOjE3NTYxNTU1NTZ9.ixgnd44DhMUh_uPMeWSGVnUG3CCzbyRXCA7JHXLR5O8"
 PER_PAGE = 100
-
-# --- Configuración del API ---
-API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
 
 # --- Credenciales de autenticación ---
 AUTH_URL = "https://dashboard-api.verifyfaces.com/auth/login"
 AUTH_EMAIL = "eangulo@blocksecurity.com.ec"
 AUTH_PASSWORD = "Scarling//07052022.?"
 
-TOKEN = None # Inicializamos el token como None
+TOKEN = None
 PER_PAGE = 100
 
-# --- Funciones para construir el dashboard desde el CSV (integradas desde build_dashboard.py) ---
 
 def leer_csv(ruta: Path):
-    """
-    Lee el CSV con columnas: fecha, person_id, conteo
-    Devuelve:
-      - registros: lista de dicts crudos
-      - agg: dict[(fecha, person_id)] = suma_conteo
-      - fechas_ordenadas: lista de fechas (str) ordenadas asc
-      - personas_ordenadas: lista de person_id ordenados por total desc
-    """
     registros = []
     agg = defaultdict(int)
     fechas = set()
@@ -362,10 +346,7 @@ def obtener_nuevo_token():
 # --- Nueva ruta para las detecciones de la API ---
 @app.route('/')
 def mostrar_detecciones():
-    """
-    Obtiene los datos de la API, los guarda en un CSV y luego
-    lee ese mismo CSV para construir y mostrar el dashboard.
-    """
+
     global fecha_ultimo_check, TOKEN
     
     # Comprobar si ha pasado al menos un minuto o si el token es nulo
@@ -374,8 +355,6 @@ def mostrar_detecciones():
             # Si la autenticación falla, mostramos un error
             return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
     
-    # A partir de aquí, el token ya está actualizado y listo para usarse
-    
         try:
             from_str = (datetime.now() - timedelta(days=1)).strftime("2025-08-01T00:00:00.000Z")
             to_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -383,7 +362,7 @@ def mostrar_detecciones():
             params = {
                 "from": from_str,
                 "to": to_str,
-                "page": 2,
+                "page": 1,
                 "perPage": PER_PAGE
             }
             headers = {"Authorization": f"Bearer {TOKEN}"}
@@ -393,6 +372,7 @@ def mostrar_detecciones():
             response.raise_for_status()
 
             data = response.json()
+            print(data)
 
             # Guardar en CSV
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
