@@ -659,7 +659,7 @@ def construir_html(
             const sid = o.sid || '';
             const cid = o.cid || '';
             const ts  = o.ts  || '';
-            // Construye la URL con el timestamp en UTC (Z) sin restar 5h
+
             const url = (sid && cid && ts)
               ? `https://dashboard.verifyfaces.com/company/54/stream/${{sid}}/camera/${{cid}}?timestamp=${{encodeURIComponent(ts)}}&search=real-time`
               : '';
@@ -667,8 +667,12 @@ def construir_html(
             const horaChip = url
               ? `<a class="chip" href="${{url}}" target="_blank" rel="noopener noreferrer">${{o.h}}</a>`
               : `<span class="chip">${{o.h}}</span>`;
+              
+            const camaraChip = url
+              ? `<a class="chip" href="${{url}}" target="_blank" rel="noopener noreferrer">${{o.c}}</a>`
+              : `<span class="chip">${{o.c}}</span>`;
 
-            return `<div class="detail-line">Persona reconocida a las ${{horaChip}} en la cámara <span class="chip">${{o.c || 'N/D'}}</span></div>`;
+            return `<div class="detail-line">Persona reconocida a las ${{horaChip}} en la cámara <span>${{camaraChip || 'N/D'}}</span></div>`;
         }}).join('')
         : `<em class="muted">Sin horas registradas</em>`;
 
