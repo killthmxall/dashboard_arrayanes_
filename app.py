@@ -116,16 +116,22 @@ def leer_csv(ruta: Path):
             except Exception:
                 pass
 
-            # NUEVO: lee cámara (si no existe en CSV antiguos quedará "")
             camara = str(row.get("camara", "")).strip()
+            search_id = str(row.get("search_id", "")).strip()   # ← NUEVO
+            camera_id = str(row.get("camera_id", "")).strip()   # ← NUEVO
+            ts_utc    = str(row.get("ts_utc", "")).strip()      # ← NUEVO
 
             registros.append({
                 "fecha": fecha,
                 "hora": hora,
                 "person_id": person_id,
                 "conteo": conteo,
-                "camara": camara,   # ← NUEVO
+                "camara": camara,
+                "search_id": search_id,   # ← NUEVO
+                "camera_id": camera_id,   # ← NUEVO
+                "ts_utc": ts_utc,         # ← NUEVO
             })
+
             agg[(fecha, person_id)] += conteo
             fechas.add(fecha)
             personas_total[person_id] += conteo
@@ -160,20 +166,24 @@ def construir_html(
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
 
-    # === Mapa de horas+cámara por (fecha, persona) -> lista de objetos {h, c}
+    # === Mapa de horas+cámara por (fecha, persona) -> lista de objetos {h, c, sid, cid, ts}
     times_by = defaultdict(list)
     for r in registros:
-        f = r["fecha"]; p = r["person_id"]; h = r["hora"]; c = r.get("camara", "")
+        f = r["fecha"]; p = r["person_id"]; h = r["hora"]
+        c = r.get("camara", "")
+        sid = r.get("search_id", "")
+        cid = r.get("camera_id", "")
+        ts  = r.get("ts_utc", "")
         if f and p and h:
-            times_by[(f, p)].append({"h": h, "c": c})
+            times_by[(f, p)].append({"h": h, "c": c, "sid": sid, "cid": cid, "ts": ts})
 
-    # Normaliza: dedup (h,c) y ordena por hora desc (más reciente primero)
+    # Dedup y orden (desc por hora mostrada)
     times_by_norm = {}
     for (f, p), items in times_by.items():
         seen = set()
         uniq = []
         for it in items:
-            key = (it["h"], it.get("c", ""))
+            key = (it["h"], it.get("c", ""), it.get("sid",""), it.get("cid",""), it.get("ts",""))
             if key not in seen:
                 seen.add(key)
                 uniq.append(it)
@@ -181,6 +191,7 @@ def construir_html(
         times_by_norm[f"{f}||{p}"] = uniq
 
     times_by_json = json.dumps(times_by_norm)
+
 
 
     # === Series para gráficos
@@ -624,7 +635,7 @@ def construir_html(
     }}
   }})();
 
-  // Expandir/cerrar filas con horas (lista vertical con mensajes + cámara)
+  // Expandir/cerrar filas con horas (lista vertical con mensajes + cámara + link al stream)
   (function attachExpandHandler(){{
     const tbody = document.querySelector('#aggTable tbody');
     if (!tbody) return;
@@ -641,11 +652,24 @@ def construir_html(
       if (alreadyOpen) {{ next.remove(); return; }}
       if (next && next.classList.contains('detail-row')) next.remove();
 
-      // Ya llega ordenado desc desde servidor; si quisieras asc, haz: arr.slice().reverse()
-      const arr = (TIMES_BY[key] || []);
+      const arr = (TIMES_BY[key] || []); // {h,c,sid,cid,ts}
 
       const lines = arr.length
-        ? arr.map(o => `<div class="detail-line">Persona reconocida a las <span class="chip">${{o.h}}</span> en la cámara <span class="chip">${{o.c || 'N/D'}}</span></div>`).join('')
+        ? arr.map(o => {{
+            const sid = o.sid || '';
+            const cid = o.cid || '';
+            const ts  = o.ts  || '';
+            // Construye la URL con el timestamp en UTC (Z) sin restar 5h
+            const url = (sid && cid && ts)
+              ? `https://dashboard.verifyfaces.com/company/54/stream/${{sid}}/camera/${{cid}}?timestamp=${{encodeURIComponent(ts)}}&search=real-time`
+              : '';
+
+            const horaChip = url
+              ? `<a class="chip" href="${{url}}" target="_blank" rel="noopener noreferrer">${{o.h}}</a>`
+              : `<span class="chip">${{o.h}}</span>`;
+
+            return `<div class="detail-line">Persona reconocida a las ${{horaChip}} en la cámara <span class="chip">${{o.c || 'N/D'}}</span></div>`;
+        }}).join('')
         : `<em class="muted">Sin horas registradas</em>`;
 
       const detail = document.createElement('tr');
@@ -659,6 +683,7 @@ def construir_html(
       tr.parentNode.insertBefore(detail, tr.nextSibling);
     }});
   }})();
+
 
 
   // Colapsa detalles de filas ocultas por filtros
@@ -808,27 +833,38 @@ def mostrar_detecciones():
 
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara"])
+                writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara", "search_id", "camera_id", "ts_utc"])
 
                 for search in all_searches:
                     if not search.get("payload") or not search["payload"].get("image"):
                         continue
 
                     original_filename = search["payload"]["image"].get("originalFilename")
-                    ts_raw = search["result"]["image"]["time"]  # "20250826232714.945"
-                    camera_name = (search.get("payload", {}).get("camera", {}) or {}).get("name", "")
+                    ts_raw = search["result"]["image"]["time"]  # p.ej. "20250827154129.873"
+                    camera_obj = (search.get("payload", {}).get("camera", {}) or {})
+                    camera_name = camera_obj.get("name", "")
+                    camera_id = camera_obj.get("id", "")           # ← NUEVO
+                    search_id = search.get("id", "")               # ← NUEVO
 
                     metadata = gallery_cache.get(original_filename, {})
                     person_name = metadata.get("name", "Nombre Desconocido")
 
                     try:
+                        # dt_utc: el 'time' del response está en UTC (¡no restar 5h para el parámetro!)
                         dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
-                        dt_local = dt_utc - timedelta(hours=5)  # America/Guayaquil
+
+                        # Para mostrar en la tabla (local, si quieres mantenerlo así):
+                        dt_local = dt_utc - timedelta(hours=5)     # America/Guayaquil
                         fecha_str = dt_local.date().isoformat()
                         hora_str  = dt_local.strftime("%H:%M:%S")
-                        writer.writerow([fecha_str, hora_str, person_name, 1, camera_name])
+
+                        # Para el link: ISO-8601 en UTC con milisegundos y sufijo Z
+                        ts_iso_z = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+                        writer.writerow([fecha_str, hora_str, person_name, 1, camera_name, search_id, camera_id, ts_iso_z])
                     except (ValueError, IndexError, TypeError):
                         continue
+
 
 
             fecha_ultimo_check = datetime.now()
