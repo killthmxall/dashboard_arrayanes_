@@ -4,9 +4,7 @@ from collections import defaultdict, Counter
 from datetime import datetime, timedelta, timezone
 from dateutil import parser
 import csv
-import os
 from pathlib import Path
-import time
 import math
 import json
 import random
@@ -24,7 +22,7 @@ AUTH_EMAIL = "eangulo@blocksecurity.com.ec"   # Sugerencia: usa variables de ent
 AUTH_PASSWORD = "Scarling//07052022.?"        # Sugerencia: usa variables de entorno en producción
 TOKEN = None
 PER_PAGE = 100
-TOTAL_RECORDS_NEEDED = 100
+TOTAL_RECORDS_NEEDED = 1000
 gallery_cache = {}
 
 # --- Funciones Auxiliares
@@ -148,69 +146,93 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
-def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_total, total_records_needed, last_ts_iso: str, percent_gallery: float, recognized_in_gallery: int, total_gallery_persons: int, ingresos_hoy: int):
-
-    # --- HTML del dashboard
+def construir_html(
+    registros, agg, agg_hora_latest, fechas, personas, personas_total,
+    total_records_needed, last_ts_iso: str,
+    percent_gallery: float, recognized_in_gallery: int, total_gallery_persons: int, ingresos_hoy: int
+):
+    # --- Métricas
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
-    total_fechas = len(set(r["fecha"] for r in registros)) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
 
+    # === Mapa de horas por (fecha, persona) -> lista de horas (para la fila expandible)
+    times_by = defaultdict(list)
+    for r in registros:
+        f = r["fecha"]; p = r["person_id"]; h = r["hora"]
+        if f and p and h:
+            times_by[(f, p)].append(h)
+
+    # Normaliza: ordena y quita duplicados
+    times_by_norm = {}
+    for (f, p), horas in times_by.items():
+        uniq = sorted(set(horas))
+        times_by_norm[f"{f}||{p}"] = uniq
+    times_by_json = json.dumps(times_by_norm)
+
+    # === Series para gráficos
     conteo_por_fecha = defaultdict(int)
     for r in registros:
         conteo_por_fecha[r["fecha"]] += r["conteo"]
-
     labels_chart = list(sorted(conteo_por_fecha.keys()))
-    data_chart = [conteo_por_fecha[f] for f in labels_chart]
+    # data_chart = [conteo_por_fecha[f] for f in labels_chart]  # (si luego quieres usarlo)
 
     top_personas = sorted(personas_total.items(), key=lambda x: -x[1])[:10]
     labels_personas = [pid for pid, _ in top_personas]
     data_personas = [cnt for _, cnt in top_personas]
 
+    # === Tabla principal (fecha, hora última, nombre clickeable, conteo)
     filas_agg = []
-    for (fecha, person_id), suma in sorted(agg.items(), key=lambda item: (item[0][0], agg_hora_latest.get((item[0][0], item[0][1]), "00:00:00"), item[1]), reverse=True):
+    for (fecha, person_id), suma in sorted(
+        agg.items(),
+        key=lambda item: (item[0][0], agg_hora_latest.get((item[0][0], item[0][1]), "00:00:00"), item[1]),
+        reverse=True
+    ):
         hora = agg_hora_latest.get((fecha, person_id), "")
+        key = f"{fecha}||{person_id}"
         filas_agg.append(
-            f"<tr data-fecha='{html_escape(fecha)}' data-hora='{html_escape(hora)}'>"
+            f"<tr data-fecha='{html_escape(fecha)}' data-hora='{html_escape(hora)}' data-key='{html_escape(key)}'>"
             f"<td class='td'>{html_escape(fecha)}</td>"
             f"<td class='td mono'>{html_escape(hora)}</td>"
-            f"<td class='td mono'>{html_escape(person_id)}</td>"
+            f"<td class='td mono'><button class='name-btn' type='button'>{html_escape(person_id)}</button></td>"
             f"<td class='td num'>{suma}</td>"
             f"</tr>"
         )
 
+    # === Pivot por persona/fecha (para stacked dataset Top10)
     pivot = {pid: {f: 0 for f in fechas} for pid in personas}
     for (fecha, person_id), suma in agg.items():
         if person_id in pivot and fecha in pivot[person_id]:
             pivot[person_id][fecha] += suma
 
-    fechas_ordenadas = sorted(fechas, reverse=True)
-
-    top_items = "".join(
-        f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
-        for pid, cnt in top_personas
-    )
-
-    # Genera colores aleatorios para gráficos
+    # Genera colores aleatorios para datasets
     def generate_random_color():
-        r = lambda: random.randint(0,255)
+        r = lambda: random.randint(0, 255)
         return f'rgba({r()},{r()},{r()},.7)'
 
-    # Datasets apilados (Top 10)
     datasets_top10 = []
     top_10_ids = [pid for pid, _ in top_personas]
     for person_id in top_10_ids:
         person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas]
         datasets_top10.append({
-            'label': html_escape(person_id),
+            'label': person_id,
             'data': person_data,
             'backgroundColor': generate_random_color(),
             'stack': 'Stack 1'
         })
     datasets_top10_json = json.dumps(datasets_top10)
 
-    # JS necesita conocer el total actual y el último TS
+    # Listado de top personas
+    top_items = "".join(
+        f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
+        for pid, cnt in top_personas
+    )
+
+    # JS: totales/ts
     js_current_total = total_registros
     js_last_ts = json.dumps(last_ts_iso)
+
+    # Hoy
+    hoy_iso = datetime.now().date().isoformat()
 
     return f"""<!doctype html>
 <html lang="es">
@@ -261,7 +283,7 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
   .filters label {{ font-size:12px; color:var(--muted); }}
   .date-input::-webkit-calendar-picker-indicator {{filter: invert(1); cursor: pointer;}}
 
-  /* === NUEVO: Animación de parpadeo de fondo y resaltado === */
+  /* Animación y alertas */
   @keyframes bg-flash {{
     0%   {{ background: #0b1020; }}
     20%  {{ background: #103b2b; }}
@@ -287,6 +309,12 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     0% {{ background: rgba(18,185,129,.4); }}
     100% {{ background: rgba(18,185,129,.15); }}
   }}
+
+  /* Botón clickeable y fila de detalle */
+  .name-btn {{ background: none; border: 0; color: var(--accent); cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }}
+  .detail-row td {{ background: #0b1226; border-top: 1px solid var(--border); }}
+  .detail-wrap {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+  .chip {{ display:inline-block; padding:4px 8px; border:1px solid var(--border); border-radius:999px; font-family: ui-monospace, monospace; font-size:12px; color:#c8d5f5; }}
 </style>
 </head>
 <body>
@@ -294,32 +322,38 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
   <div id="newAlert">¡Nueva detección!</div>
 
   <div class="wrap">
-    <span><img src="https://res.cloudinary.com/df5olfhrq/image/upload/v1756228647/logo_tpskcd.png" alt="BlockSecurity" style="height:80px; margin-bottom:16px;"></span> <span style="padding: 5px"> <img src="https://arrayanes.com/wp-content/uploads/2025/05/LOGO-ARRAYANES-1024x653.webp" alt="Arrayanes" style="height:80px; margin-bottom:16px;"><h1>Dashboard de detecciones Arrayanes Country Club</h1>
+    <span><img src="https://res.cloudinary.com/df5olfhrq/image/upload/v1756228647/logo_tpskcd.png" alt="BlockSecurity" style="height:80px; margin-bottom:16px;"></span>
+    <span style="padding: 5px">
+      <img src="https://arrayanes.com/wp-content/uploads/2025/05/LOGO-ARRAYANES-1024x653.webp" alt="Arrayanes" style="height:80px; margin-bottom:16px;">
+    </span>
+    <h1>Dashboard de detecciones Arrayanes Country Club</h1>
+
     <div class="grid cards">
-      <!-- 1) Cobertura de galería -->
       <div class="card">
         <h3>Cobertura de galería</h3>
         <div class="val">{percent_gallery:.1f}%</div>
         <div class="muted">{recognized_in_gallery}/{total_gallery_persons} personas reconocidas</div>
       </div>
 
-      <!-- 2) Ingresos hoy -->
       <div class="card">
         <h3>Ingresos hoy</h3>
         <div class="val">{ingresos_hoy}</div>
-        <div class="muted">Suma de detecciones de </div><div>{datetime.now().date().isoformat()}</div>
+        <div class="muted">Suma de detecciones de</div><div>{hoy_iso}</div>
       </div>
 
-      <!-- 3) Personas únicas (puedes cambiar por otra métrica si prefieres) -->
       <div class="card">
         <h3>Personas únicas</h3>
         <div class="val">{total_personas}</div>
         <div class="muted">Total de personas detectadas en el rango de registros</div>
       </div>
-      <div class="card"><h3>Registros</h3><div class="val"><input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;"></div></div>
+
+      <div class="card">
+        <h3>Registros</h3>
+        <div class="val">
+          <input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;">
+        </div>
+      </div>
     </div>
-    
-    
 
     <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10 personas)</h2></div>
@@ -332,13 +366,10 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     </div>
 
     <div class="section">
-      <div class="toolbar">
-        <h2 style="margin-right:auto">Top personas detectadas</h2>
-      </div>
+      <div class="toolbar"><h2 style="margin-right:auto">Top personas detectadas</h2></div>
       <ul class="list">{top_items}</ul>
     </div>
 
-    <!-- === TABLA AGREGADA CON FILTROS === -->
     <div class="section">
       <div class="toolbar" style="gap:12px;">
         <h2 style="margin-right:auto">Tabla de detecciones (fecha · nombre · conteo)</h2>
@@ -355,10 +386,12 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
           <label for="dateEnd">Hasta</label>
           <input type="date" id="dateEnd" class="input">
         </div>
+
         <div class="group" style="flex:1;">
           <label for="nameFilter">Persona</label>
           <input type="text" id="nameFilter" class="input w100" placeholder="Ej.: Juan Pérez">
         </div>
+
         <div class="group">
           <button id="clearFilters" class="input" style="cursor:pointer;">Limpiar</button>
         </div>
@@ -367,12 +400,12 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
       <div class="table-wrap">
         <table id="aggTable">
           <thead>
-            <tr><th class="th">fecha</th><th class="th">hora</th><th class="th">nombre</th><th class="th right">conteo</th></tr>
+            <tr><th class="th">fecha</th><th class="th">hora (última)</th><th class="th">nombre</th><th class="th right">conteo</th></tr>
           </thead>
           <tbody>{''.join(filas_agg)}</tbody>
         </table>
       </div>
-      <div class="hint">Se agrupan múltiples filas del CSV ({html_escape(CSV_FILE.name)}) sumando su columna <code>conteo</code>. Los filtros de fecha y persona se aplican a las filas visibles.</div>
+      <div class="hint">Se agrupan múltiples filas del CSV sumando su columna <code>conteo</code>. Los filtros de fecha y persona se aplican a las filas visibles.</div>
     </div>
 
     <div class="footer">Generado {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
@@ -381,11 +414,14 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <script>
-  // === Estado inicial desde servidor (para detección de cambios) ===
+  // Estado inicial desde servidor (para detección de cambios)
   let CURRENT_TOTAL = {js_current_total};
   let CURRENT_LAST_TS = {js_last_ts};
 
-  // --- Filtro libre (texto contiene) para tabla agregada
+  // Horas por (fecha||persona) inyectadas desde servidor
+  const TIMES_BY = {times_by_json};
+
+  // Filtro libre (texto contiene)
   (function(){{
     const input = document.getElementById('filterAgg');
     const tbody = document.querySelector('#aggTable tbody');
@@ -399,20 +435,7 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     }});
   }})();
 
-  // --- Filtro tabla pivot por nombre
-  (function(){{
-    const input = document.getElementById('filterPivot');
-    const tbody = document.querySelector('#pivotTable tbody');
-    input && input.addEventListener('input', function(){{
-      const q = this.value.toLowerCase();
-      for (const tr of tbody.rows) {{
-        const firstCell = tr.cells[0].innerText.toLowerCase();
-        tr.style.display = firstCell.includes(q) ? '' : 'none';
-      }}
-    }});
-  }})();
-
-  // --- Filtros: fecha desde/hasta + persona para tabla agregada
+  // Filtros: fecha desde/hasta + persona
   (function(){{
     const tbody = document.querySelector('#aggTable tbody');
     const dateStart = document.getElementById('dateStart');
@@ -435,12 +458,19 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
       return normalizeDateStr(s.trim());
     }}
 
-    function applySpecificFilters() {{
+    window.applySpecificFilters = function applySpecificFilters() {{
       const start = normalizeDateStr(dateStart.value);
       const end = normalizeDateStr(dateEnd.value);
       const nameQ = (nameFilter.value || '').toLowerCase();
 
       for (const tr of tbody.rows) {{
+        if (tr.classList.contains('detail-row')) {{
+          const prev = tr.previousElementSibling;
+          if (!prev) {{ tr.remove(); continue; }}
+          tr.style.display = prev.style.display;
+          continue;
+        }}
+
         const cellDateStr = tr.cells[0].innerText || '';
         const cellNameStr = tr.cells[2].innerText || '';
         const rowDate = parseCellDateStr(cellDateStr);
@@ -458,6 +488,9 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
 
         tr.style.display = (nameOk && dateOk && freeOk) ? '' : 'none';
       }}
+
+      // Limpia detalles de filas ocultas
+      collapseHiddenDetails();
     }}
 
     dateStart && dateStart.addEventListener('change', applySpecificFilters);
@@ -475,18 +508,18 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     applySpecificFilters();
   }})();
 
-  // --- Cambiar número de registros (recarga con query param)
+  // Cambiar número de registros (recarga con query param)
   document.getElementById('num_registros').addEventListener('change', function(){{
     window.location.href = '/?records=' + this.value;
   }});
 
-  // --- Gráfico de barras apiladas (Top 10)
+  // Gráfico de barras apiladas (Top 10)
   (function(){{
     const ctx = document.getElementById('top10Chart').getContext('2d');
     new Chart(ctx, {{
       type: 'bar',
       data: {{
-        labels: {labels_chart},
+        labels: {json.dumps(labels_chart)},
         datasets: {datasets_top10_json}
       }},
       options: {{
@@ -503,16 +536,16 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     }});
   }})();
 
-  // --- Gráfico Top 10 (barras horizontales)
+  // Gráfico Top 10 (barras horizontales)
   (function(){{
     const ctx2 = document.getElementById('personasChart').getContext('2d');
     new Chart(ctx2, {{
       type: 'bar',
       data: {{
-        labels: {labels_personas},
+        labels: {json.dumps(labels_personas)},
         datasets: [{{
           label: 'Detecciones',
-          data: {data_personas},
+          data: {json.dumps(data_personas)},
           backgroundColor: 'rgba(255, 206, 86, 0.7)',
           borderColor: 'rgba(255, 206, 86, 1)',
           borderWidth: 1
@@ -531,7 +564,7 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     }});
   }})();
 
-  // === NUEVO: utilidades TS y visual alert ===
+  // Utilidades polling/alerta
   function parseIsoLocal(s) {{
     if (!s) return null;
     const d = new Date(s);
@@ -555,7 +588,6 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     }}, 1200);
   }}
 
-  // === NUEVO: resaltar filas nuevas tras recarga
   (function highlightNewRowsAfterReload(){{
     const threshold = localStorage.getItem('highlightAfterReloadGT');
     if (!threshold) return;
@@ -565,6 +597,7 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
 
     const thr = parseIsoLocal(threshold);
     for (const tr of tbody.rows) {{
+      if (tr.classList.contains('detail-row')) continue;
       const iso = rowToIsoString(tr);
       const dt = parseIsoLocal(iso);
       if (thr && dt && dt > thr) {{
@@ -573,7 +606,53 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     }}
   }})();
 
-  // === NUEVO: Polling de cambios
+  // Expandir/cerrar filas con horas
+  (function attachExpandHandler(){{
+    const tbody = document.querySelector('#aggTable tbody');
+    if (!tbody) return;
+
+    tbody.addEventListener('click', function(e){{
+      const btn = e.target.closest('.name-btn');
+      if (!btn) return;
+
+      const tr = btn.closest('tr');
+      const key = tr.getAttribute('data-key');
+      const next = tr.nextElementSibling;
+      const alreadyOpen = next && next.classList.contains('detail-row');
+
+      if (alreadyOpen) {{ next.remove(); return; }}
+
+      if (next && next.classList.contains('detail-row')) next.remove();
+
+      const horas = (TIMES_BY[key] || []).slice().sort();
+      const chips = horas.length
+        ? horas.map(h => `<span class="chip">${{h}}</span>`).join(' ')
+        : `<em class="muted">Sin horas registradas</em>`;
+
+
+      const detail = document.createElement('tr');
+      detail.className = 'detail-row';
+      detail.innerHTML = `<td colspan="4">
+        <div class="detail-wrap">
+            <strong>Horas detectadas:</strong> ${{chips}}
+        </div>
+      </td>`;
+
+      tr.parentNode.insertBefore(detail, tr.nextSibling);
+    }});
+  }})();
+
+  // Colapsa detalles de filas ocultas por filtros
+  function collapseHiddenDetails(){{
+    const tbody = document.querySelector('#aggTable tbody');
+    if (!tbody) return;
+    for (const tr of Array.from(tbody.querySelectorAll('tr.detail-row'))) {{
+      const prev = tr.previousElementSibling;
+      if (!prev || prev.style.display === 'none') tr.remove();
+    }}
+  }}
+
+  // Polling de cambios
   async function pollStats() {{
     try {{
       const r = await fetch('/api/stats', {{ cache: 'no-store' }});
@@ -583,7 +662,6 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
       const newLast = data.ultima_ts_iso || "";
 
       if (newTotal > CURRENT_TOTAL) {{
-        // Guardamos umbral para resaltar filas posteriores al último visto
         if (CURRENT_LAST_TS) {{
           localStorage.setItem('highlightAfterReloadGT', CURRENT_LAST_TS);
         }}
@@ -607,6 +685,7 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
 </body>
 </html>
 """
+
 
 
 def obtener_nuevo_token():
@@ -633,7 +712,6 @@ def obtener_nuevo_token():
 # --- Endpoint ligero para polling del front
 @app.route('/api/stats')
 def api_stats():
-  
     registros, _, _, _, _, _ = leer_csv(CSV_FILE)
     total = sum((r.get("conteo", 0) or 0) for r in registros) if registros else 0
 
@@ -725,7 +803,7 @@ def mostrar_detecciones():
 
                     try:
                         dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")  # si el 'time' está en UTC
-                        dt_local = dt_utc - timedelta(hours=5)
+                        dt_local = dt_utc - timedelta(hours=5)  # ajustar a tu zona si aplica
                         fecha_str = dt_local.date().isoformat()
                         hora_str  = dt_local.strftime("%H:%M:%S")
                         writer.writerow([fecha_str, hora_str, person_name, 1])
@@ -789,7 +867,7 @@ def mostrar_detecciones():
     html_dashboard = construir_html(
         registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total,
         total_records_needed, last_ts_iso,
-        # === NUEVO: argumentos para cards ===
+        # Cards:
         percent_gallery, recognized_in_gallery, total_gallery_persons, ingresos_hoy
     )
 
