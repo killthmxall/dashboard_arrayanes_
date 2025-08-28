@@ -185,15 +185,6 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
 
     fechas_ordenadas = sorted(fechas, reverse=True)
 
-    th_fechas = "".join(f"<th class='th'>{html_escape(f)}</th>" for f in fechas_ordenadas)
-    filas_pivot = []
-    for pid in personas:
-        celdas = "".join(f"<td class='td num'>{pivot[pid][f]}</td>" for f in fechas_ordenadas)
-        filas_pivot.append(
-            f"<tr><td class='td mono'>{html_escape(pid)}</td>{celdas}"
-            f"<td class='td num strong'>{sum(pivot[pid].values())}</td></tr>"
-        )
-
     top_items = "".join(
         f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
         for pid, cnt in top_personas
@@ -331,12 +322,12 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
     
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10)</h2></div>
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10 personas)</h2></div>
       <canvas id="personasChart" height="100"></canvas>
     </div>
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Top 10)</h2></div>
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Top 10 personas)</h2></div>
       <canvas id="top10Chart" height="100"></canvas>
     </div>
 
@@ -382,23 +373,6 @@ def construir_html(registros, agg, agg_hora_latest, fechas, personas, personas_t
         </table>
       </div>
       <div class="hint">Se agrupan múltiples filas del CSV ({html_escape(CSV_FILE.name)}) sumando su columna <code>conteo</code>. Los filtros de fecha y persona se aplican a las filas visibles.</div>
-    </div>
-
-    <!-- === TABLA PIVOT === -->
-    <div class="section">
-      <div class="toolbar">
-        <h2 style="margin-right:auto">Tabla de detecciones (nombre × fecha)</h2>
-        <input class="input" id="filterPivot" placeholder="Filtra por nombre...">
-      </div>
-      <div class="table-wrap">
-        <table id="pivotTable">
-          <thead>
-            <tr><th class="th">person_id</th>{th_fechas}<th class="th right">total</th></tr>
-          </thead>
-          <tbody>{''.join(filas_pivot)}</tbody>
-        </table>
-      </div>
-      <div class="hint">Cada celda muestra la suma de <code>conteo</code> para ese <code>person_id</code> en la fecha correspondiente.</div>
     </div>
 
     <div class="footer">Generado {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
