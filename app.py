@@ -282,6 +282,10 @@ def construir_html(
   .filters .group {{ display:flex; gap:8px; align-items:center; }}
   .filters label {{ font-size:12px; color:var(--muted); }}
   .date-input::-webkit-calendar-picker-indicator {{filter: invert(1); cursor: pointer;}}
+  .detail-col {{ display: flex; flex-direction: column; gap: 6px; padding: 6px 0; }}
+  .detail-line {{ display: flex; padding: 6px 0; padding-left: 20px; font-size: 12px; color: #80FF82; }}
+  .detail-line .mono {{ font-family: ui-monospace, monospace; }}
+
 
   /* Animación y alertas */
   @keyframes bg-flash {{
@@ -314,7 +318,7 @@ def construir_html(
   .name-btn {{ background: none; border: 0; color: var(--accent); cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }}
   .detail-row td {{ background: #0b1226; border-top: 1px solid var(--border); }}
   .detail-wrap {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
-  .chip {{ display:inline-block; padding:4px 8px; border:1px solid var(--border); border-radius:999px; font-family: ui-monospace, monospace; font-size:12px; color:#c8d5f5; }}
+  .chip {{ display:inline-block; padding:4px 8px; border:1px solid var(--border); border-radius:999px; font-family: ui-monospace, monospace; font-size:12px; color:#40B1FF; }}
 </style>
 </head>
 <body>
@@ -607,40 +611,40 @@ def construir_html(
   }})();
 
   // Expandir/cerrar filas con horas
-  (function attachExpandHandler(){{
-    const tbody = document.querySelector('#aggTable tbody');
-    if (!tbody) return;
+(function attachExpandHandler(){{
+  const tbody = document.querySelector('#aggTable tbody');
+  if (!tbody) return;
 
-    tbody.addEventListener('click', function(e){{
-      const btn = e.target.closest('.name-btn');
-      if (!btn) return;
+  tbody.addEventListener('click', function(e){{
+    const btn = e.target.closest('.name-btn');
+    if (!btn) return;
 
-      const tr = btn.closest('tr');
-      const key = tr.getAttribute('data-key');
-      const next = tr.nextElementSibling;
-      const alreadyOpen = next && next.classList.contains('detail-row');
+    const tr = btn.closest('tr');
+    const key = tr.getAttribute('data-key');
+    const next = tr.nextElementSibling;
+    const alreadyOpen = next && next.classList.contains('detail-row');
 
-      if (alreadyOpen) {{ next.remove(); return; }}
+    if (alreadyOpen) {{ next.remove(); return; }}
+    if (next && next.classList.contains('detail-row')) next.remove();
 
-      if (next && next.classList.contains('detail-row')) next.remove();
+    // Ordena horas: más reciente primero (desc)
+    const horas = (TIMES_BY[key] || []).slice().sort().reverse();
 
-      const horas = (TIMES_BY[key] || []).slice().sort();
-      const chips = horas.length
-        ? horas.map(h => `<span class="chip">${{h}}</span>`).join(' ')
-        : `<em class="muted">Sin horas registradas</em>`;
+    const lines = horas.length
+      ? horas.map(h => `<div class="detail-line">Persona reconocida a las <span class="chip">${{h}}</span></div>`).join('')
+      : `<em class="muted">Sin horas registradas</em>`;
 
+    const detail = document.createElement('tr');
+    detail.className = 'detail-row';
+    detail.innerHTML = `<td colspan="4">
+      <div class="detail-col">
+        ${{lines}}
+      </div>
+    </td>`;
 
-      const detail = document.createElement('tr');
-      detail.className = 'detail-row';
-      detail.innerHTML = `<td colspan="4">
-        <div class="detail-wrap">
-            <strong>Horas detectadas:</strong> ${{chips}}
-        </div>
-      </td>`;
-
-      tr.parentNode.insertBefore(detail, tr.nextSibling);
-    }});
-  }})();
+    tr.parentNode.insertBefore(detail, tr.nextSibling);
+  }});
+}})();
 
   // Colapsa detalles de filas ocultas por filtros
   function collapseHiddenDetails(){{
