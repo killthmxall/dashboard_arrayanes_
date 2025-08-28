@@ -104,31 +104,36 @@ def leer_csv(ruta: Path):
             fecha = str(row.get("fecha", "")).strip()
             hora = str(row.get("hora", "")).strip()
             person_id = str(row.get("nombre_persona", "")).strip()
-
             try:
                 conteo = int(row.get("conteo", "1"))
             except ValueError:
                 conteo = 1
-
             if not fecha or not person_id:
                 continue
-
-            # normaliza fecha si viniera con hora
             try:
                 fecha_dt = datetime.fromisoformat(str(fecha).split(" ")[0])
                 fecha = fecha_dt.date().isoformat()
             except Exception:
                 pass
 
-            registros.append({"fecha": fecha, "hora": hora, "person_id": person_id, "conteo": conteo})
+            # NUEVO: lee cámara (si no existe en CSV antiguos quedará "")
+            camara = str(row.get("camara", "")).strip()
+
+            registros.append({
+                "fecha": fecha,
+                "hora": hora,
+                "person_id": person_id,
+                "conteo": conteo,
+                "camara": camara,   # ← NUEVO
+            })
             agg[(fecha, person_id)] += conteo
             fechas.add(fecha)
             personas_total[person_id] += conteo
 
-            # guarda la hora más reciente por (fecha, persona)
             key = (fecha, person_id)
             if key not in agg_hora_latest or _is_time_b_greater(agg_hora_latest.get(key, ""), hora):
                 agg_hora_latest[key] = hora
+
 
     fechas_ordenadas = sorted(fechas)
     personas_ordenadas = [pid for pid, _ in sorted(personas_total.items(), key=lambda x: (-x[1], x[0]))]
@@ -155,19 +160,28 @@ def construir_html(
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
 
-    # === Mapa de horas por (fecha, persona) -> lista de horas (para la fila expandible)
+    # === Mapa de horas+cámara por (fecha, persona) -> lista de objetos {h, c}
     times_by = defaultdict(list)
     for r in registros:
-        f = r["fecha"]; p = r["person_id"]; h = r["hora"]
+        f = r["fecha"]; p = r["person_id"]; h = r["hora"]; c = r.get("camara", "")
         if f and p and h:
-            times_by[(f, p)].append(h)
+            times_by[(f, p)].append({"h": h, "c": c})
 
-    # Normaliza: ordena y quita duplicados
+    # Normaliza: dedup (h,c) y ordena por hora desc (más reciente primero)
     times_by_norm = {}
-    for (f, p), horas in times_by.items():
-        uniq = sorted(set(horas))
+    for (f, p), items in times_by.items():
+        seen = set()
+        uniq = []
+        for it in items:
+            key = (it["h"], it.get("c", ""))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(it)
+        uniq.sort(key=lambda x: x["h"], reverse=True)
         times_by_norm[f"{f}||{p}"] = uniq
+
     times_by_json = json.dumps(times_by_norm)
+
 
     # === Series para gráficos
     conteo_por_fecha = defaultdict(int)
@@ -315,7 +329,7 @@ def construir_html(
   }}
 
   /* Botón clickeable y fila de detalle */
-  .name-btn {{ background: none; border: 0; color: var(--accent); cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }}
+  .name-btn {{ background: none; border: 0; color: #c8d5f5; cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }}
   .detail-row td {{ background: #0b1226; border-top: 1px solid var(--border); }}
   .detail-wrap {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
   .chip {{ display:inline-block; padding:4px 8px; border:1px solid var(--border); border-radius:999px; font-family: ui-monospace, monospace; font-size:12px; color:#40B1FF; }}
@@ -610,41 +624,42 @@ def construir_html(
     }}
   }})();
 
-  // Expandir/cerrar filas con horas
-(function attachExpandHandler(){{
-  const tbody = document.querySelector('#aggTable tbody');
-  if (!tbody) return;
+  // Expandir/cerrar filas con horas (lista vertical con mensajes + cámara)
+  (function attachExpandHandler(){{
+    const tbody = document.querySelector('#aggTable tbody');
+    if (!tbody) return;
 
-  tbody.addEventListener('click', function(e){{
-    const btn = e.target.closest('.name-btn');
-    if (!btn) return;
+    tbody.addEventListener('click', function(e){{
+      const btn = e.target.closest('.name-btn');
+      if (!btn) return;
 
-    const tr = btn.closest('tr');
-    const key = tr.getAttribute('data-key');
-    const next = tr.nextElementSibling;
-    const alreadyOpen = next && next.classList.contains('detail-row');
+      const tr = btn.closest('tr');
+      const key = tr.getAttribute('data-key');
+      const next = tr.nextElementSibling;
+      const alreadyOpen = next && next.classList.contains('detail-row');
 
-    if (alreadyOpen) {{ next.remove(); return; }}
-    if (next && next.classList.contains('detail-row')) next.remove();
+      if (alreadyOpen) {{ next.remove(); return; }}
+      if (next && next.classList.contains('detail-row')) next.remove();
 
-    // Ordena horas: más reciente primero (desc)
-    const horas = (TIMES_BY[key] || []).slice().sort().reverse();
+      // Ya llega ordenado desc desde servidor; si quisieras asc, haz: arr.slice().reverse()
+      const arr = (TIMES_BY[key] || []);
 
-    const lines = horas.length
-      ? horas.map(h => `<div class="detail-line">Persona reconocida a las <span class="chip">${{h}}</span></div>`).join('')
-      : `<em class="muted">Sin horas registradas</em>`;
+      const lines = arr.length
+        ? arr.map(o => `<div class="detail-line">Persona reconocida a las <span class="chip">${{o.h}}</span> en la cámara <span class="chip">${{o.c || 'N/D'}}</span></div>`).join('')
+        : `<em class="muted">Sin horas registradas</em>`;
 
-    const detail = document.createElement('tr');
-    detail.className = 'detail-row';
-    detail.innerHTML = `<td colspan="4">
-      <div class="detail-col">
-        ${{lines}}
-      </div>
-    </td>`;
+      const detail = document.createElement('tr');
+      detail.className = 'detail-row';
+      detail.innerHTML = `<td colspan="4">
+        <div class="detail-col">
+          ${{lines}}
+        </div>
+      </td>`;
 
-    tr.parentNode.insertBefore(detail, tr.nextSibling);
-  }});
-}})();
+      tr.parentNode.insertBefore(detail, tr.nextSibling);
+    }});
+  }})();
+
 
   // Colapsa detalles de filas ocultas por filtros
   function collapseHiddenDetails(){{
@@ -793,26 +808,28 @@ def mostrar_detecciones():
 
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["fecha", "hora", "nombre_persona", "conteo"])
+                writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara"])
 
                 for search in all_searches:
                     if not search.get("payload") or not search["payload"].get("image"):
                         continue
 
                     original_filename = search["payload"]["image"].get("originalFilename")
-                    ts_raw = search["result"]["image"]["time"]  # ejemplo: "20250826232714.945"
+                    ts_raw = search["result"]["image"]["time"]  # "20250826232714.945"
+                    camera_name = (search.get("payload", {}).get("camera", {}) or {}).get("name", "")
 
                     metadata = gallery_cache.get(original_filename, {})
                     person_name = metadata.get("name", "Nombre Desconocido")
 
                     try:
-                        dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")  # si el 'time' está en UTC
-                        dt_local = dt_utc - timedelta(hours=5)  # ajustar a tu zona si aplica
+                        dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
+                        dt_local = dt_utc - timedelta(hours=5)  # America/Guayaquil
                         fecha_str = dt_local.date().isoformat()
                         hora_str  = dt_local.strftime("%H:%M:%S")
-                        writer.writerow([fecha_str, hora_str, person_name, 1])
+                        writer.writerow([fecha_str, hora_str, person_name, 1, camera_name])
                     except (ValueError, IndexError, TypeError):
                         continue
+
 
             fecha_ultimo_check = datetime.now()
 
