@@ -221,7 +221,7 @@ def construir_html(
 
     # --- Obtener las fechas de los últimos 7 días ---
     hoy = datetime.now().date()
-    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(10, -1, -1)]
+    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(9, -1, -1)]
     fechas_semana = [f for f in ultima_semana if f in fechas]
 
     # --- Se generan labels para el gráfico (última semana) ---
