@@ -318,7 +318,6 @@ def construir_html(
   .detail-line {{ display: flex; padding: 6px 0; padding-left: 20px; font-size: 12px; color: #80FF82; }}
   .detail-line .mono {{ font-family: ui-monospace, monospace; }}
 
-
   /* Animación y alertas */
   @keyframes bg-flash {{
     0%   {{ background: #0b1020; }}
@@ -327,7 +326,7 @@ def construir_html(
     70%  {{ background: #3b1010; }}
     100% {{ background: #0b1020; }}
   }}
-  body.flash {{ animation: bg-flash 1.2s ease-in-out 1; }}
+  body.flash {{ animation: bg-flash 5s ease-in-out 1; }}
 
   #newAlert {{
     position: fixed; z-index: 9999; left: 50%; top: 16px; transform: translateX(-50%);
@@ -397,7 +396,9 @@ def construir_html(
 
     <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10 personas)</h2></div>
-      <canvas id="personasChart" height="100"></canvas>
+      <div class="chart-container">
+        <canvas id="personasChart" height="100"></canvas>
+      </div>
     </div>
 
     <div class="section">
