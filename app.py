@@ -183,8 +183,6 @@ def construir_html(
 
     times_by_json = json.dumps(times_by_norm)
 
-
-
     conteo_por_fecha = defaultdict(int)
     for r in registros:
         conteo_por_fecha[r["fecha"]] += r["conteo"]
@@ -219,6 +217,32 @@ def construir_html(
     def generate_random_color():
         r = lambda: random.randint(0, 255)
         return f'rgba({r()},{r()},{r()},.7)'
+    
+
+    # --- Obtener las fechas de los últimos 7 días ---
+    hoy = datetime.now().date()
+    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    fechas_semana = [f for f in ultima_semana if f in fechas]
+
+    # --- Se generan labels para el gráfico (última semana) ---
+    labels_chart_week = json.dumps(fechas_semana)
+
+    # --- Se generan datasets para el gráfico (última semana) ---
+    datasets_all = []
+    for person_id in personas:
+        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas_semana]
+
+        # Solo incluir si hay al menos una detección (>0) en la semana
+        if any(valor > 0 for valor in person_data):
+            datasets_all.append({
+                'label': html_escape(person_id),
+                'data': person_data,
+                'backgroundColor': generate_random_color(),
+                'stack': 'Stack 1'
+            })
+
+    datasets_all_json = json.dumps(datasets_all)
+
 
     datasets_top10 = []
     top_10_ids = [pid for pid, _ in top_personas]
@@ -367,6 +391,11 @@ def construir_html(
     </div>
 
     <div class="section">
+      <div class="toolbar"><h2 style="margin-right:auto">Top 10 personas detectadas</h2></div>
+      <ul class="list">{top_items}</ul>
+    </div>
+
+    <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Detecciones por nombre (Top 10 personas)</h2></div>
       <canvas id="personasChart" height="100"></canvas>
     </div>
@@ -377,8 +406,8 @@ def construir_html(
     </div>
 
     <div class="section">
-      <div class="toolbar"><h2 style="margin-right:auto">Top personas detectadas</h2></div>
-      <ul class="list">{top_items}</ul>
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Esta semana)</h2></div>
+      <canvas id="thisWeekChart" height="100"></canvas>
     </div>
 
     <div class="section">
@@ -540,6 +569,29 @@ def construir_html(
       }}
     }});
   }})();
+
+  // Gráfico de barras apiladas de ESTA SEMANA
+  (function() {{
+    const ctx = document.getElementById('thisWeekChart').getContext('2d');
+    new Chart(ctx, {{
+      type: 'bar',
+      data: {{
+        labels: {labels_chart_week},
+        datasets: {datasets_all_json}
+      }},
+      options: {{
+        responsive: true,
+        scales: {{
+          x: {{ stacked: true }},
+          y: {{
+            stacked: true,
+            beginAtZero: true,
+            ticks: {{ precision:0 }}
+          }}
+        }}
+      }}
+    }});
+  }})( );
 
   (function(){{
     const ctx2 = document.getElementById('personasChart').getContext('2d');
@@ -777,7 +829,7 @@ def mostrar_detecciones():
             from_dt_utc = datetime.now(timezone.utc) - timedelta(days=1)
             to_dt_utc   = datetime.now(timezone.utc)
 
-            from_str = from_dt_utc.strftime("2025-08-01T01:00:00.000Z")
+            from_str = from_dt_utc.strftime("%Y-%m-01T01:00:00.000Z")
             to_str   = to_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
             num_pages = math.ceil(total_records_needed / PER_PAGE)
