@@ -9,7 +9,6 @@ import math
 import json
 import random
 
-#  Se crea una instancia de la aplicación Flask.
 app = Flask(__name__)
 
 # --- Variables Globales
@@ -18,16 +17,14 @@ fecha_ultimo_check = datetime.now() - timedelta(minutes=2)
 CSV_FILE = Path("detecciones_server.csv")
 API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
 AUTH_URL = "https://dashboard-api.verifyfaces.com/auth/login"
-AUTH_EMAIL = "eangulo@blocksecurity.com.ec"   # Sugerencia: usa variables de entorno en producción
-AUTH_PASSWORD = "Scarling//07052022.?"        # Sugerencia: usa variables de entorno en producción
+AUTH_EMAIL = "eangulo@blocksecurity.com.ec"
+AUTH_PASSWORD = "Scarling//07052022.?"
 TOKEN = None
 PER_PAGE = 100
 TOTAL_RECORDS_NEEDED = 1000
 gallery_cache = {}
 
-# --- Funciones Auxiliares
 def cargar_cache_galeria():
-    # --- Se carga TODA la galería en la cache
     global TOKEN, gallery_cache
 
     if not TOKEN and not obtener_nuevo_token():
@@ -47,7 +44,6 @@ def cargar_cache_galeria():
             params = {"perPage": per_page, "page": page}
             resp = requests.get(base_url, headers=headers, params=params, timeout=10)
 
-            # Si el token expiró, reintenta una única vez
             if resp.status_code == 401:
                 if not obtener_nuevo_token():
                     print("401: no se pudo renovar el token.")
@@ -65,12 +61,11 @@ def cargar_cache_galeria():
             for image_data in images:
                 original_filename = image_data.get("originalFilename")
                 metadata = image_data.get("metadata")
-                # Evita colisiones / entradas vacías
+
                 if original_filename and isinstance(metadata, dict):
                     gallery_cache[original_filename] = metadata
                     total_cargados += 1
 
-            # Si esta página trajo menos que el tope, ya estamos en la última
             if len(images) < per_page:
                 break
 
@@ -87,7 +82,7 @@ def cargar_cache_galeria():
 def leer_csv(ruta: Path):
     registros = []
     agg = defaultdict(int)
-    agg_hora_latest = {}  # (fecha, person_id) -> "HH:MM:SS" más reciente
+    agg_hora_latest = {} 
     fechas = set()
     personas_total = Counter()
 
@@ -95,7 +90,6 @@ def leer_csv(ruta: Path):
         return [], {}, {}, [], [], {}
 
     def _is_time_b_greater(a: str, b: str) -> bool:
-        # compara lexicográficamente HH:MM:SS de forma segura
         return (b or "") > (a or "")
 
     with ruta.open(newline="", encoding="utf-8") as f:
@@ -117,9 +111,9 @@ def leer_csv(ruta: Path):
                 pass
 
             camara = str(row.get("camara", "")).strip()
-            search_id = str(row.get("search_id", "")).strip()   # ← NUEVO
-            camera_id = str(row.get("camera_id", "")).strip()   # ← NUEVO
-            ts_utc    = str(row.get("ts_utc", "")).strip()      # ← NUEVO
+            search_id = str(row.get("search_id", "")).strip()   
+            camera_id = str(row.get("camera_id", "")).strip()   
+            ts_utc    = str(row.get("ts_utc", "")).strip()     
 
             registros.append({
                 "fecha": fecha,
@@ -127,9 +121,9 @@ def leer_csv(ruta: Path):
                 "person_id": person_id,
                 "conteo": conteo,
                 "camara": camara,
-                "search_id": search_id,   # ← NUEVO
-                "camera_id": camera_id,   # ← NUEVO
-                "ts_utc": ts_utc,         # ← NUEVO
+                "search_id": search_id,  
+                "camera_id": camera_id,   
+                "ts_utc": ts_utc,         
             })
 
             agg[(fecha, person_id)] += conteo
@@ -162,11 +156,9 @@ def construir_html(
     total_records_needed, last_ts_iso: str,
     percent_gallery: float, recognized_in_gallery: int, total_gallery_persons: int, ingresos_hoy: int
 ):
-    # --- Métricas
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
 
-    # === Mapa de horas+cámara por (fecha, persona) -> lista de objetos {h, c, sid, cid, ts}
     times_by = defaultdict(list)
     for r in registros:
         f = r["fecha"]; p = r["person_id"]; h = r["hora"]
@@ -177,7 +169,6 @@ def construir_html(
         if f and p and h:
             times_by[(f, p)].append({"h": h, "c": c, "sid": sid, "cid": cid, "ts": ts})
 
-    # Dedup y orden (desc por hora mostrada)
     times_by_norm = {}
     for (f, p), items in times_by.items():
         seen = set()
@@ -194,18 +185,15 @@ def construir_html(
 
 
 
-    # === Series para gráficos
     conteo_por_fecha = defaultdict(int)
     for r in registros:
         conteo_por_fecha[r["fecha"]] += r["conteo"]
     labels_chart = list(sorted(conteo_por_fecha.keys()))
-    # data_chart = [conteo_por_fecha[f] for f in labels_chart]  # (si luego quieres usarlo)
 
     top_personas = sorted(personas_total.items(), key=lambda x: -x[1])[:10]
     labels_personas = [pid for pid, _ in top_personas]
     data_personas = [cnt for _, cnt in top_personas]
 
-    # === Tabla principal (fecha, hora última, nombre clickeable, conteo)
     filas_agg = []
     for (fecha, person_id), suma in sorted(
         agg.items(),
@@ -223,13 +211,11 @@ def construir_html(
             f"</tr>"
         )
 
-    # === Pivot por persona/fecha (para stacked dataset Top10)
     pivot = {pid: {f: 0 for f in fechas} for pid in personas}
     for (fecha, person_id), suma in agg.items():
         if person_id in pivot and fecha in pivot[person_id]:
             pivot[person_id][fecha] += suma
 
-    # Genera colores aleatorios para datasets
     def generate_random_color():
         r = lambda: random.randint(0, 255)
         return f'rgba({r()},{r()},{r()},.7)'
@@ -246,17 +232,14 @@ def construir_html(
         })
     datasets_top10_json = json.dumps(datasets_top10)
 
-    # Listado de top personas
     top_items = "".join(
         f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
         for pid, cnt in top_personas
     )
 
-    # JS: totales/ts
     js_current_total = total_registros
     js_last_ts = json.dumps(last_ts_iso)
 
-    # Hoy
     hoy_iso = datetime.now().date().isoformat()
 
     return f"""<!doctype html>
@@ -339,7 +322,6 @@ def construir_html(
     100% {{ background: rgba(18,185,129,.15); }}
   }}
 
-  /* Botón clickeable y fila de detalle */
   .name-btn {{ background: none; border: 0; color: #c8d5f5; cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }}
   .detail-row td {{ background: #0b1226; border-top: 1px solid var(--border); }}
   .detail-wrap {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
@@ -443,14 +425,11 @@ def construir_html(
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <script>
-  // Estado inicial desde servidor (para detección de cambios)
   let CURRENT_TOTAL = {js_current_total};
   let CURRENT_LAST_TS = {js_last_ts};
 
-  // Horas por (fecha||persona) inyectadas desde servidor
   const TIMES_BY = {times_by_json};
 
-  // Filtro libre (texto contiene)
   (function(){{
     const input = document.getElementById('filterAgg');
     const tbody = document.querySelector('#aggTable tbody');
@@ -464,7 +443,6 @@ def construir_html(
     }});
   }})();
 
-  // Filtros: fecha desde/hasta + persona
   (function(){{
     const tbody = document.querySelector('#aggTable tbody');
     const dateStart = document.getElementById('dateStart');
@@ -537,12 +515,10 @@ def construir_html(
     applySpecificFilters();
   }})();
 
-  // Cambiar número de registros (recarga con query param)
   document.getElementById('num_registros').addEventListener('change', function(){{
     window.location.href = '/?records=' + this.value;
   }});
 
-  // Gráfico de barras apiladas (Top 10)
   (function(){{
     const ctx = document.getElementById('top10Chart').getContext('2d');
     new Chart(ctx, {{
@@ -565,7 +541,6 @@ def construir_html(
     }});
   }})();
 
-  // Gráfico Top 10 (barras horizontales)
   (function(){{
     const ctx2 = document.getElementById('personasChart').getContext('2d');
     new Chart(ctx2, {{
@@ -593,7 +568,6 @@ def construir_html(
     }});
   }})();
 
-  // Utilidades polling/alerta
   function parseIsoLocal(s) {{
     if (!s) return null;
     const d = new Date(s);
@@ -635,7 +609,6 @@ def construir_html(
     }}
   }})();
 
-  // Expandir/cerrar filas con horas (lista vertical con mensajes + cámara + link al stream)
   (function attachExpandHandler(){{
     const tbody = document.querySelector('#aggTable tbody');
     if (!tbody) return;
@@ -652,7 +625,7 @@ def construir_html(
       if (alreadyOpen) {{ next.remove(); return; }}
       if (next && next.classList.contains('detail-row')) next.remove();
 
-      const arr = (TIMES_BY[key] || []); // {h,c,sid,cid,ts}
+      const arr = (TIMES_BY[key] || []); // {{h,c,sid,cid,ts}}
 
       const lines = arr.length
         ? arr.map(o => {{
@@ -690,7 +663,6 @@ def construir_html(
 
 
 
-  // Colapsa detalles de filas ocultas por filtros
   function collapseHiddenDetails(){{
     const tbody = document.querySelector('#aggTable tbody');
     if (!tbody) return;
@@ -700,7 +672,6 @@ def construir_html(
     }}
   }}
 
-  // Polling de cambios
   async function pollStats() {{
     try {{
       const r = await fetch('/api/stats', {{ cache: 'no-store' }});
@@ -737,7 +708,6 @@ def construir_html(
 
 
 def obtener_nuevo_token():
-    # --- Se conecta a la API de autenticación y actualiza el token global
     global TOKEN
     try:
         auth_data = {
@@ -757,7 +727,6 @@ def obtener_nuevo_token():
         print(f"Error al obtener el token: {e}")
         return False
 
-# --- Endpoint ligero para polling del front
 @app.route('/api/stats')
 def api_stats():
     registros, _, _, _, _, _ = leer_csv(CSV_FILE)
@@ -785,7 +754,6 @@ def api_stats():
 def mostrar_detecciones():
     global fecha_ultimo_check, TOKEN, gallery_cache
 
-    # Obtener el número de registros desde la URL o predeterminado
     try:
         total_records_needed = int(request.args.get('records', TOTAL_RECORDS_NEEDED))
     except (ValueError, TypeError):
@@ -809,7 +777,7 @@ def mostrar_detecciones():
             from_dt_utc = datetime.now(timezone.utc) - timedelta(days=1)
             to_dt_utc   = datetime.now(timezone.utc)
 
-            from_str = from_dt_utc.strftime("2025-08-01T01:00:00.000Z")   # Ajusta ventana si lo deseas
+            from_str = from_dt_utc.strftime("2025-08-01T01:00:00.000Z")
             to_str   = to_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
             num_pages = math.ceil(total_records_needed / PER_PAGE)
@@ -844,32 +812,27 @@ def mostrar_detecciones():
                         continue
 
                     original_filename = search["payload"]["image"].get("originalFilename")
-                    ts_raw = search["result"]["image"]["time"]  # p.ej. "20250827154129.873"
+                    ts_raw = search["result"]["image"]["time"] 
                     camera_obj = (search.get("payload", {}).get("camera", {}) or {})
                     camera_name = camera_obj.get("name", "")
-                    camera_id = camera_obj.get("id", "")           # ← NUEVO
-                    search_id = search.get("id", "")               # ← NUEVO
+                    camera_id = camera_obj.get("id", "")          
+                    search_id = search.get("id", "")             
 
                     metadata = gallery_cache.get(original_filename, {})
                     person_name = metadata.get("name", "Nombre Desconocido")
 
                     try:
-                        # dt_utc: el 'time' del response está en UTC (¡no restar 5h para el parámetro!)
                         dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
 
-                        # Para mostrar en la tabla (local, si quieres mantenerlo así):
-                        dt_local = dt_utc - timedelta(hours=5)     # America/Guayaquil
+                        dt_local = dt_utc - timedelta(hours=5)
                         fecha_str = dt_local.date().isoformat()
                         hora_str  = dt_local.strftime("%H:%M:%S")
 
-                        # Para el link: ISO-8601 en UTC con milisegundos y sufijo Z
                         ts_iso_z = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
                         writer.writerow([fecha_str, hora_str, person_name, 1, camera_name, search_id, camera_id, ts_iso_z])
                     except (ValueError, IndexError, TypeError):
                         continue
-
-
 
             fecha_ultimo_check = datetime.now()
 
@@ -888,10 +851,8 @@ def mostrar_detecciones():
             error_message = f"Ocurrió un error inesperado: {e}"
             return f"<h1>Error</h1><p>{error_message}</p>", 500
 
-    # --- Carga CSV para construir HTML y calcular último TS
     registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
 
-    # Último timestamp
     last_ts = None
     for r in registros:
         f = r.get("fecha") or ""
@@ -907,7 +868,6 @@ def mostrar_detecciones():
                 pass
     last_ts_iso = last_ts.isoformat() if last_ts else ""
 
-    # 1) Cobertura de galería
     gallery_names = set()
     try:
         for meta in (gallery_cache or {}).values():
@@ -954,7 +914,6 @@ def obtener_imagenes_galeria():
 
         data = response.json()
         print("Respuesta de la API de la galería:")
-        # print(json.dumps(data, indent=2))  # opcional
 
     except requests.exceptions.HTTPError as e:
         print(f"Error HTTP al obtener imágenes: {e.response.status_code} - {e.response.text}")
