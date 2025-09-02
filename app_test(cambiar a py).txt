@@ -8,9 +8,13 @@ from pathlib import Path
 import math
 import json
 import random
+from urllib.parse import urlparse, urlunparse  # <-- para fallbacks de descarga
+from threading import Thread, Event  # <-- Event para ejecutar pipeline una sola vez
+import os
 
 app = Flask(__name__)
 
+# --- Variables Globales
 detecciones = defaultdict(lambda: defaultdict(int))
 fecha_ultimo_check = datetime.now() - timedelta(minutes=2)
 CSV_FILE = Path("detecciones_server.csv")
@@ -22,82 +26,173 @@ TOKEN = None
 PER_PAGE = 100
 TOTAL_RECORDS_NEEDED = 1000
 gallery_cache = {}
-PERSON_IMG_MAP = {}
 
-from typing import Optional, Any, Dict
+# --- Directorio de fotos y CSV histórico
+FOTOS_DIR = Path("fotos_socios")
+FOTOS_DIR.mkdir(exist_ok=True)
+HIST_CSV_FILE = Path("detecciones_historicas.csv")
 
-def _extract_image_url(image_data: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(image_data, dict):
-        return None
+# --- Base de datos de fotos ya posteadas (para no repetir)
+POSTED_DB = Path("fotos_posteadas.json")
 
-    for k in ("thumbnailUrl", "url", "publicUrl"):
-        v = image_data.get(k)
-        if isinstance(v, str) and v:
-            return v
+# --- Cámaras del ejemplo (IDs entregados)
+CAMERA_IDS = [1177, 1176, 1186, 1184, 1628, 1175]
 
-    img = image_data.get("image")
-    if isinstance(img, dict):
-        v = img.get("url")
-        if isinstance(v, str) and v:
-            return v
+# --- Flag de arranque único por proceso/worker
+PIPELINE_STARTED = Event()
 
-    f = image_data.get("file")
-    if isinstance(f, dict):
-        v = f.get("url")
-        if isinstance(v, str) and v:
-            return v
 
-    return None
+def _load_posted_set() -> set:
+    """
+    Carga el conjunto de nombres de archivo ya posteados.
+    Estructura esperada del JSON: {"files": ["a.jpg", "b.png", ...]}
+    """
+    try:
+        if POSTED_DB.exists():
+            with POSTED_DB.open("r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+                files = data.get("files", [])
+                return set(str(x) for x in files)
+    except Exception as e:
+        print(f"[posted_db] No se pudo leer {POSTED_DB}: {e}")
+    return set()
+
+
+def _save_posted_set(posted_set: set):
+    """
+    Guarda el conjunto de archivos posteados de manera atómica.
+    """
+    tmp = POSTED_DB.with_suffix(".tmp")
+    try:
+        payload = {"files": sorted(list(posted_set))}
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, POSTED_DB)
+    except Exception as e:
+        print(f"[posted_db] Error guardando {POSTED_DB}: {e}")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _download_with_fallbacks(url: str, dest: Path, timeout: int = 20) -> bool:
+    """
+    Intenta descargar una imagen probando variantes de host y stream.
+    """
+    def _try(u, use_stream=False):
+        try:
+            if use_stream:
+                with requests.get(u, timeout=timeout, stream=True) as r:
+                    r.raise_for_status()
+                    with dest.open("wb") as f:
+                        for chunk in r.iter_content(64 * 1024):
+                            if chunk:
+                                f.write(chunk)
+            else:
+                r = requests.get(u, timeout=timeout)
+                r.raise_for_status()
+                with dest.open("wb") as f:
+                    f.write(r.content)
+            return True
+        except requests.exceptions.RequestException:
+            return False
+
+    # 1) URL tal cual
+    if _try(url):
+        return True
+
+    # 2) Reescritura de host si viene en formato s3.amazonaws.com/<bucket>/...
+    try:
+        pu = urlparse(url)
+        if pu.netloc == "s3.amazonaws.com" and pu.path.lstrip("/").startswith("dashboard-files.verifyfaces.com/"):
+            new_path = pu.path.lstrip("/")[len("dashboard-files.verifyfaces.com"):]
+            alt = urlunparse(("https", "dashboard-files.verifyfaces.com", new_path, "", "", ""))
+            if _try(alt):
+                return True
+            if _try(alt, use_stream=True):
+                return True
+    except Exception:
+        pass
+
+    # 3) Último intento con stream sobre la URL original
+    if _try(url, use_stream=True):
+        return True
+
+    return False
 
 
 def cargar_cache_galeria():
-    global TOKEN, gallery_cache, PERSON_IMG_MAP
+    """
+    Carga la galería a memoria (gallery_cache) y descarga, una sola vez,
+    las fotos de cada persona en 'fotos_socios/' usando originalFilename
+    como nombre de archivo. Si ya existen, NO las descarga nuevamente.
+    """
+    global TOKEN, gallery_cache
+
     if not TOKEN and not obtener_nuevo_token():
         print("Error: No se pudo obtener un token para la galería")
         return False
+
     base_url = "https://dashboard-api.verifyfaces.com/companies/54/galleries/531"
     headers = {"Authorization": f"Bearer {TOKEN}"}
     per_page = 100
     page = 1
+
     gallery_cache.clear()
-    PERSON_IMG_MAP.clear()
     total_cargados = 0
+    descargadas = 0
+
     try:
         while True:
             params = {"perPage": per_page, "page": page}
             resp = requests.get(base_url, headers=headers, params=params, timeout=10)
+
             if resp.status_code == 401:
                 if not obtener_nuevo_token():
                     print("401: no se pudo renovar el token.")
                     return False
                 headers["Authorization"] = f"Bearer {TOKEN}"
                 resp = requests.get(base_url, headers=headers, params=params, timeout=10)
+
             resp.raise_for_status()
             data = resp.json()
+
             images = data.get("images", [])
             if not images:
                 break
+
             for image_data in images:
                 original_filename = image_data.get("originalFilename")
                 metadata = image_data.get("metadata")
-                img_url = _extract_image_url(image_data)
+                url = image_data.get("url")
+
                 if original_filename and isinstance(metadata, dict):
-                    gallery_cache[original_filename] = {
-                        "metadata": metadata,
-                        "image_url": img_url
-                    }
+                    gallery_cache[original_filename] = metadata
                     total_cargados += 1
-                    person_name = metadata.get("name")
-                    if person_name and img_url and person_name not in PERSON_IMG_MAP:
-                        PERSON_IMG_MAP[person_name] = img_url
+
+                    # Descarga única si no existe
+                    dest = FOTOS_DIR / original_filename
+                    if not dest.exists() and url:
+                        ok = _download_with_fallbacks(url, dest, timeout=20)
+                        if ok:
+                            descargadas += 1
+                        else:
+                            print(f"No se pudo descargar {original_filename} desde {url}")
+
             if len(images) < per_page:
                 break
+
             page += 1
-        print(f"Galería cargada: {total_cargados} imágenes en caché.")
+
+        print(f"Galería cargada: {total_cargados} imágenes en caché. Descargadas nuevas: {descargadas}")
         return True
+
     except requests.exceptions.RequestException as e:
         print(f"Error al cargar la caché de la galería: {e}")
         return False
+
 
 def leer_csv(ruta: Path):
     registros = []
@@ -105,10 +200,13 @@ def leer_csv(ruta: Path):
     agg_hora_latest = {}
     fechas = set()
     personas_total = Counter()
+
     if not ruta.exists():
         return [], {}, {}, [], [], {}
+
     def _is_time_b_greater(a: str, b: str) -> bool:
         return (b or "") > (a or "")
+
     with ruta.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -126,10 +224,12 @@ def leer_csv(ruta: Path):
                 fecha = fecha_dt.date().isoformat()
             except Exception:
                 pass
+
             camara = str(row.get("camara", "")).strip()
             search_id = str(row.get("search_id", "")).strip()
             camera_id = str(row.get("camera_id", "")).strip()
             ts_utc    = str(row.get("ts_utc", "")).strip()
+
             registros.append({
                 "fecha": fecha,
                 "hora": hora,
@@ -140,15 +240,20 @@ def leer_csv(ruta: Path):
                 "camera_id": camera_id,
                 "ts_utc": ts_utc,
             })
+
             agg[(fecha, person_id)] += conteo
             fechas.add(fecha)
             personas_total[person_id] += conteo
+
             key = (fecha, person_id)
             if key not in agg_hora_latest or _is_time_b_greater(agg_hora_latest.get(key, ""), hora):
                 agg_hora_latest[key] = hora
+
     fechas_ordenadas = sorted(fechas)
     personas_ordenadas = [pid for pid, _ in sorted(personas_total.items(), key=lambda x: (-x[1], x[0]))]
+
     return registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total
+
 
 def html_escape(s: str) -> str:
     return (
@@ -160,14 +265,245 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
+
+# --- Herramientas de histórico (POST/GET) ---
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+def _last_week_range_utc():
+    end_utc = _utc_now()
+    start_utc = end_utc - timedelta(days=7)
+    fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+    return start_utc.strftime(fmt), end_utc.strftime(fmt)
+
+def _mime_from_suffix(p: Path):
+    suf = p.suffix.lower()
+    if suf in [".jpg", ".jpeg"]:
+        return "image/jpeg"
+    if suf == ".png":
+        return "image/png"
+    return "application/octet-stream"
+
+def post_historical_searches_for_all_photos():
+    """
+    Envía POST /companies/54/search/historical por lotes de 20 imágenes
+    sobre las cámaras indicadas y en la ventana última semana.
+    No repite imágenes ya posteadas (usa fotos_posteadas.json).
+    """
+    global TOKEN
+    if not TOKEN and not obtener_nuevo_token():
+        return {"ok": False, "msg": "No se pudo obtener token"}
+
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    url = "https://dashboard-api.verifyfaces.com/companies/54/search/historical"
+
+    startAt, endAt = _last_week_range_utc()
+
+    # Recolecta imágenes del directorio (únicas por nombre)
+    fotos = sorted({p.name: p for p in FOTOS_DIR.iterdir() if p.is_file()}.values(), key=lambda x: x.name)
+
+    total = len(fotos)
+    if total == 0:
+        return {"ok": True, "msg": "No hay fotos en fotos_socios", "posted": 0}
+
+    # Cargar set de posteadas para no repetir
+    posted_set = _load_posted_set()
+
+    # Filtrar solo las NO posteadas
+    fotos_pendientes = [p for p in fotos if p.name not in posted_set]
+    if not fotos_pendientes:
+        return {"ok": True, "msg": "Todas las fotos del directorio ya fueron posteadas previamente", "posted": 0, "total_photos": total}
+
+    posted_now = 0
+    batch_size = 20
+    for i in range(0, len(fotos_pendientes), batch_size):
+        chunk = fotos_pendientes[i:i+batch_size]
+
+        # Campos formulario
+        data = {
+            "startAt": startAt,
+            "endAt": endAt,
+        }
+        # Cámaras
+        for idx, cam_id in enumerate(CAMERA_IDS):
+            data[f"cameras[{idx}][id]"] = str(cam_id)
+
+        files = []
+        opened = []
+        try:
+            for p in chunk:
+                mime = _mime_from_suffix(p)
+                f = p.open("rb")
+                opened.append(f)
+                files.append(("images", (p.name, f, mime)))
+
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=90)
+            if resp.status_code == 401:
+                if not obtener_nuevo_token():
+                    for f in opened:
+                        f.close()
+                    return {"ok": False, "msg": "Token expirado y no renovable", "posted": posted_now}
+                headers["Authorization"] = f"Bearer {TOKEN}"
+                resp = requests.post(url, headers=headers, data=data, files=files, timeout=90)
+
+            resp.raise_for_status()
+
+            # Sólo si el POST fue exitoso, marcamos estos nombres como posteados
+            for p in chunk:
+                posted_set.add(p.name)
+            _save_posted_set(posted_set)
+            posted_now += len(chunk)
+
+        except Exception as e:
+            for f in opened:
+                f.close()
+            # Guardar progreso hasta el fallo
+            _save_posted_set(posted_set)
+            return {"ok": False, "msg": f"Error en POST histórico: {e}", "posted": posted_now}
+        finally:
+            for f in opened:
+                f.close()
+
+    return {"ok": True, "msg": "POSTs históricos enviados (sin repetir imágenes)", "posted": posted_now, "total_photos": total}
+
+
+def _parse_time_compact(ts: str):
+    # ts como "20250830185521.986"
+    try:
+        base, _, _ = ts.partition(".")
+        dt = datetime.strptime(base, "%Y%m%d%H%M%S")
+        return dt
+    except Exception:
+        return None
+
+def fetch_historical_and_save_csv():
+    """
+    GET paginado a /companies/54/search/historical?from&to&page&perPage
+    Guarda CSV: fecha, hora, originalFilename, conteo(1 por evento)
+    """
+    global TOKEN
+    if not TOKEN and not obtener_nuevo_token():
+        return {"ok": False, "msg": "No se pudo obtener token"}
+
+    headers = {"Authorization": f"Bearer {TOKEN}", "accept": "application/json"}
+    base = "https://dashboard-api.verifyfaces.com/companies/54/search/historical"
+
+    startAt, endAt = _last_week_range_utc()
+    page = 1
+    per_page = 100
+
+    rows = []  # (fecha, hora, originalFilename, conteo)
+    try:
+        while True:
+            params = {
+                "from": startAt,
+                "to": endAt,
+                "page": page,
+                "perPage": per_page
+            }
+            r = requests.get(base, headers=headers, params=params, timeout=30)
+            if r.status_code == 401:
+                if not obtener_nuevo_token():
+                    return {"ok": False, "msg": "Token expirado y no renovable"}
+                headers["Authorization"] = f"Bearer {TOKEN}"
+                r = requests.get(base, headers=headers, params=params, timeout=30)
+
+            r.raise_for_status()
+            data = r.json() or {}
+            searches = data.get("searches", [])
+
+            if not searches:
+                break
+
+            for s in searches:
+                # originalFilename en payload.images[0].originalFilename
+                ofn = None
+                try:
+                    pl_imgs = (s.get("payload", {}) or {}).get("images", []) or []
+                    if pl_imgs:
+                        ofn = pl_imgs[0].get("originalFilename")
+                except Exception:
+                    ofn = None
+
+                # detecciones en result.images[*].time
+                rimgs = (s.get("result", {}) or {}).get("images", []) or []
+                for it in rimgs:
+                    ts = it.get("time")
+                    dt = _parse_time_compact(ts) if ts else None
+                    if dt:
+                        # Ajuste a tu UTC-5
+                        dt_local = dt - timedelta(hours=5)
+                        fecha = dt_local.date().isoformat()
+                        hora = dt_local.strftime("%H:%M:%S")
+                        rows.append((fecha, hora, ofn or "", 1))
+
+            if len(searches) < per_page:
+                break
+            page += 1
+
+        with HIST_CSV_FILE.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["fecha", "hora", "originalFilename", "conteo"])
+            for (f, h, o, c) in rows:
+                w.writerow([f, h, o, c])
+
+        return {"ok": True, "msg": f"Guardado {len(rows)} filas en {HIST_CSV_FILE.name}"}
+
+    except Exception as e:
+        return {"ok": False, "msg": f"Error GET histórico: {e}"}
+
+
+# --- lector del CSV histórico para el pie ---
+def leer_csv_historico(ruta: Path):
+    """
+    Lee detecciones_historicas.csv -> retorna:
+    - ultimo_dia (str o None)
+    - labels (nombres de persona) y data (conteos) para ese día
+    Usa gallery_cache para mapear originalFilename -> metadata['name'] (si existe)
+    """
+    if not ruta.exists():
+        return None, [], []
+
+    per_date_per_ofn = defaultdict(lambda: defaultdict(int))
+    with ruta.open(newline="", encoding="utf-8") as fh:
+        rd = csv.DictReader(fh)
+        for row in rd:
+            fecha = (row.get("fecha") or "").strip()
+            ofn = (row.get("originalFilename") or "").strip()
+            try:
+                c = int(row.get("conteo", "1"))
+            except ValueError:
+                c = 1
+            if fecha and ofn:
+                per_date_per_ofn[fecha][ofn] += c
+
+    if not per_date_per_ofn:
+        return None, [], []
+
+    ultimo_dia = sorted(per_date_per_ofn.keys())[-1]
+    dist = per_date_per_ofn[ultimo_dia]  # dict ofn -> conteo
+
+    labels = []
+    data = []
+    for ofn, cnt in sorted(dist.items(), key=lambda x: -x[1]):
+        meta = gallery_cache.get(ofn) or {}
+        nombre = meta.get("name") or ofn
+        labels.append(nombre)
+        data.append(cnt)
+
+    return ultimo_dia, labels, data
+
+
 def construir_html(
     registros, agg, agg_hora_latest, fechas, personas, personas_total,
     total_records_needed, last_ts_iso: str,
     percent_gallery: float, recognized_in_gallery: int, total_gallery_persons: int, ingresos_hoy: int,
-    person_img_map: dict
+    # --- parámetros para el pie ---
+    pie_date: str, pie_labels: list, pie_data: list
 ):
     total_registros = sum(r["conteo"] for r in registros) if registros else 0
     total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
+
     times_by = defaultdict(list)
     for r in registros:
         f = r["fecha"]; p = r["person_id"]; h = r["hora"]
@@ -177,6 +513,7 @@ def construir_html(
         ts  = r.get("ts_utc", "")
         if f and p and h:
             times_by[(f, p)].append({"h": h, "c": c, "sid": sid, "cid": cid, "ts": ts})
+
     times_by_norm = {}
     for (f, p), items in times_by.items():
         seen = set()
@@ -188,26 +525,51 @@ def construir_html(
                 uniq.append(it)
         uniq.sort(key=lambda x: x["h"], reverse=True)
         times_by_norm[f"{f}||{p}"] = uniq
+
     times_by_json = json.dumps(times_by_norm)
+
     conteo_por_fecha = defaultdict(int)
     for r in registros:
         conteo_por_fecha[r["fecha"]] += r["conteo"]
     labels_chart = list(sorted(conteo_por_fecha.keys()))
+
     top_personas = sorted(personas_total.items(), key=lambda x: -x[1])[:10]
     labels_personas = [pid for pid, _ in top_personas]
     data_personas = [cnt for _, cnt in top_personas]
+
     filas_agg = []
-    def generate_random_color():
-        r = lambda: random.randint(0, 255)
-        return f'rgba({r()},{r()},{r()},.7)'
+    for (fecha, person_id), suma in sorted(
+        agg.items(),
+        key=lambda item: (item[0][0], agg_hora_latest.get((item[0][0], item[0][1]), "00:00:00"), item[1]),
+        reverse=True
+    ):
+        hora = agg_hora_latest.get((fecha, person_id), "")
+        key = f"{fecha}||{person_id}"
+        filas_agg.append(
+            f"<tr data-fecha='{html_escape(fecha)}' data-hora='{html_escape(hora)}' data-key='{html_escape(key)}'>"
+            f"<td class='td'>{html_escape(fecha)}</td>"
+            f"<td class='td mono'>{html_escape(hora)}</td>"
+            f"<td class='td mono'><button class='name-btn' type='button'>{html_escape(person_id)}</button></td>"
+            f"<td class='td num'>{suma}</td>"
+            f"</tr>"
+        )
+
     pivot = {pid: {f: 0 for f in fechas} for pid in personas}
     for (fecha, person_id), suma in agg.items():
         if person_id in pivot and fecha in pivot[person_id]:
             pivot[person_id][fecha] += suma
+
+    def generate_random_color():
+        r = lambda: random.randint(0, 255)
+        return f'rgba({r()},{r()},{r()},.7)'
+
+    # últimas fechas para chart semanal (10 días como en tu lógica)
     hoy = datetime.now().date()
-    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(11, -1, -1)]
+    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(9, -1, -1)]
     fechas_semana = [f for f in ultima_semana if f in fechas]
+
     labels_chart_week = json.dumps(fechas_semana)
+
     datasets_all = []
     for person_id in personas:
         person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas_semana]
@@ -218,7 +580,9 @@ def construir_html(
                 'backgroundColor': generate_random_color(),
                 'stack': 'Stack 1'
             })
+
     datasets_all_json = json.dumps(datasets_all)
+
     datasets_top10 = []
     top_10_ids = [pid for pid, _ in top_personas]
     for person_id in top_10_ids:
@@ -230,46 +594,22 @@ def construir_html(
             'stack': 'Stack 1'
         })
     datasets_top10_json = json.dumps(datasets_top10)
+
     top_items = "".join(
         f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
         for pid, cnt in top_personas
     )
+
     js_current_total = total_registros
     js_last_ts = json.dumps(last_ts_iso)
+
     hoy_iso = datetime.now().date().isoformat()
-    def initials(name: str) -> str:
-        parts = [p for p in (name or "").split() if p]
-        if not parts:
-            return "?"
-        if len(parts) == 1:
-            return parts[0][:2].upper()
-        return (parts[0][:1] + parts[-1][:1]).upper()
-    for (fecha, person_id), suma in sorted(
-        agg.items(),
-        key=lambda item: (item[0][0], agg_hora_latest.get((item[0][0], item[0][1]), "00:00:00"), item[1]),
-        reverse=True
-    ):
-        hora = agg_hora_latest.get((fecha, person_id), "")
-        key = f"{fecha}||{person_id}"
-        img_url = person_img_map.get(person_id)
-        if img_url:
-            avatar_html = (
-                f"<span class='avatar'>"
-                f"<img src='{html_escape(img_url)}' "
-                f"alt='{html_escape(person_id)}' "
-                f"onerror='this.replaceWith(Object.assign(document.createElement(\"span\"),{{className:\"avatar\", innerText:\"{html_escape(initials(person_id))}\"}}));'>"
-                f"</span>"
-            )
-        else:
-            avatar_html = f"<span class='avatar'>{html_escape(initials(person_id))}</span>"
-        filas_agg.append(
-            f"<tr data-fecha='{html_escape(fecha)}' data-hora='{html_escape(hora)}' data-key='{html_escape(key)}'>"
-            f"<td class='td'>{html_escape(fecha)}</td>"
-            f"<td class='td mono'>{html_escape(hora)}</td>"
-            f"<td class='td name-cell'>{avatar_html}<button class='name-btn' type='button'>{html_escape(person_id)}</button></td>"
-            f"<td class='td num'>{suma}</td>"
-            f"</tr>"
-        )
+
+    # datos del pie en JSON
+    pie_labels_js = json.dumps(pie_labels or [])
+    pie_data_js = json.dumps(pie_data or [])
+    pie_title_js = json.dumps(pie_date or "")
+
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -289,7 +629,7 @@ def construir_html(
   * {{ box-sizing: border-box; }}
   html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui; }}
   .wrap {{ max-width: 1200px; margin: 32px auto; padding: 0 16px; }}
-  h1 {{ margin: 0 0 16px; font-size: 28px; font-weight: 700; letter-spacing: .2px; }}
+  h1 {{ margin: 0 0 16px; font-size: 28px; font-weight: 700; }}
   .muted {{ color: var(--muted); }}
   .grid {{ display: grid; gap: 16px; }}
   .cards {{ grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 20px; }}
@@ -322,6 +662,7 @@ def construir_html(
   .detail-line {{ display: flex; padding: 6px 0; padding-left: 20px; font-size: 12px; color: #80FF82; }}
   .detail-line .mono {{ font-family: ui-monospace, monospace; }}
 
+  /* Animación y alertas */
   @keyframes bg-flash {{
     0%   {{ background: #0b1020; }}
     20%  {{ background: #103b2b; }}
@@ -352,10 +693,6 @@ def construir_html(
   .detail-row td {{ background: #0b1226; border-top: 1px solid var(--border); }}
   .detail-wrap {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
   .chip {{ display:inline-block; padding:4px 8px; border:1px solid var(--border); border-radius:999px; font-family: ui-monospace, monospace; font-size:12px; color:#40B1FF; }}
-
-  .name-cell {{ display:flex; align-items:center; gap:10px; }}
-  .avatar {{ width: 28px; height: 28px; border-radius: 50%; background: #0b1226; border: 1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size: 12px; color: #9fb4da; font-weight:700; overflow:hidden; }}
-  .avatar img {{ width:100%; height:100%; object-fit:cover; display:block; }}
 </style>
 </head>
 <body>
@@ -388,7 +725,7 @@ def construir_html(
         <div class="muted">Total de personas detectadas en el rango de registros</div>
       </div>
 
-      <div class="card" style="display: none">
+      <div class="card">
         <h3>Registros</h3>
         <div class="val">
           <input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;">
@@ -416,6 +753,15 @@ def construir_html(
     <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona y fecha (Esta semana)</h2></div>
       <canvas id="thisWeekChart" height="100"></canvas>
+    </div>
+
+    <!-- Pie de detecciones histórico (último día del CSV) -->
+    <div class="section">
+      <div class="toolbar"><h2 style="margin-right:auto">Detecciones por persona (último día histórico)</h2></div>
+      <div class="chart-container">
+        <canvas id="pieDetecciones" height="120"></canvas>
+        <div class="hint">Fecha: <span id="pieFecha"></span></div>
+      </div>
     </div>
 
     <div class="section">
@@ -466,6 +812,11 @@ def construir_html(
   let CURRENT_LAST_TS = {js_last_ts};
 
   const TIMES_BY = {times_by_json};
+
+  // Datos pie históricos inyectados desde el backend
+  const PIE_LABELS = {pie_labels_js};   // [ "Nombre 1", "Nombre 2", ... ]
+  const PIE_DATA   = {pie_data_js};     // [ 5, 3, ... ]
+  const PIE_TITLE  = {pie_title_js};    // "YYYY-MM-DD" (último día del CSV)
 
   (function(){{
     const input = document.getElementById('filterAgg');
@@ -533,6 +884,7 @@ def construir_html(
         tr.style.display = (nameOk && dateOk && freeOk) ? '' : 'none';
       }}
 
+      // Limpia detalles de filas ocultas
       collapseHiddenDetails();
     }}
 
@@ -577,6 +929,7 @@ def construir_html(
     }});
   }})();
 
+  // Gráfico de barras apiladas de ESTA SEMANA
   (function() {{
     const ctx = document.getElementById('thisWeekChart').getContext('2d');
     new Chart(ctx, {{
@@ -624,6 +977,34 @@ def construir_html(
         }}
       }}
     }});
+  }})();
+
+  // Pie de detecciones (último día del CSV histórico)
+  (function(){{
+    try {{
+      const ctx = document.getElementById('pieDetecciones').getContext('2d');
+      const lbls = Array.isArray(PIE_LABELS) ? PIE_LABELS : [];
+      const vals = Array.isArray(PIE_DATA) ? PIE_DATA : [];
+      const fechaElem = document.getElementById('pieFecha');
+      if (fechaElem && typeof PIE_TITLE === 'string') fechaElem.textContent = PIE_TITLE;
+      if (lbls.length && vals.length) {{
+        new Chart(ctx, {{
+          type: 'pie',
+          data: {{
+            labels: lbls,              // [ ... ]
+            datasets: [{{
+              label: 'Detecciones',
+              data: vals               // [ ... ]
+            }}]
+          }},
+          options: {{
+            responsive: true
+          }}
+        }});
+      }}
+    }} catch(e) {{
+      // silencioso
+    }}
   }})();
 
   function parseIsoLocal(s) {{
@@ -683,7 +1064,7 @@ def construir_html(
       if (alreadyOpen) {{ next.remove(); return; }}
       if (next && next.classList.contains('detail-row')) next.remove();
 
-      const arr = (TIMES_BY[key] || []);
+      const arr = (TIMES_BY[key] || []); // {{h,c,sid,cid,ts}}
 
       const lines = arr.length
         ? arr.map(o => {{
@@ -749,14 +1130,18 @@ def construir_html(
       }} else {{
         if (newLast) CURRENT_LAST_TS = newLast;
       }}
-    }} catch (e) {{}}
+    }} catch (e) {{
+      // Silencioso
+    }}
   }}
 
+  // Inicia polling cada 3s
   setInterval(pollStats, 3000);
 </script>
 </body>
 </html>
 """
+
 
 def obtener_nuevo_token():
     global TOKEN
@@ -767,6 +1152,7 @@ def obtener_nuevo_token():
         }
         response = requests.post(AUTH_URL, json=auth_data, timeout=10)
         response.raise_for_status()
+
         new_token = response.json().get("token")
         if new_token:
             TOKEN = new_token
@@ -781,6 +1167,7 @@ def obtener_nuevo_token():
 def api_stats():
     registros, _, _, _, _, _ = leer_csv(CSV_FILE)
     total = sum((r.get("conteo", 0) or 0) for r in registros) if registros else 0
+
     ultima = None
     for r in registros:
         f = r.get("fecha") or ""
@@ -794,31 +1181,101 @@ def api_stats():
                     ultima = dt
             except Exception:
                 continue
+
     ultima_iso = ultima.isoformat() if ultima else ""
     return jsonify({"total_registros": total, "ultima_ts_iso": ultima_iso})
 
+# --- ENDPOINTS para pipeline histórico manual (opcional)
+@app.route('/api/historical/load', methods=['POST'])
+def api_historical_load():
+    if not TOKEN and not obtener_nuevo_token():
+        return jsonify({"ok": False, "msg": "No se pudo autenticar"}), 500
+
+    res = post_historical_searches_for_all_photos()
+    status = 200 if res.get("ok") else 500
+    return jsonify(res), status
+
+@app.route('/api/historical/fetch', methods=['POST'])
+def api_historical_fetch():
+    if not TOKEN and not obtener_nuevo_token():
+        return jsonify({"ok": False, "msg": "No se pudo autenticar"}), 500
+
+    res = fetch_historical_and_save_csv()
+    status = 200 if res.get("ok") else 500
+    return jsonify(res), status
+
+
+# --- Pipeline histórico automático (una vez) en Render/Local
+def _historical_pipeline_worker():
+    try:
+        print("[startup] Iniciando pipeline histórico…")
+        if not TOKEN and not obtener_nuevo_token():
+            print("[startup] No se pudo autenticar.")
+            return
+
+        # Asegura que la galería esté en memoria y fotos descargadas
+        if not cargar_cache_galeria():
+            print("[startup] No se pudo cargar la galería.")
+            return
+
+        # POST histórico (lotes de 20, sin repetir)
+        res_post = post_historical_searches_for_all_photos()
+        print(f"[startup] Resultado POST histórico: {res_post}")
+
+        # GET histórico para CSV
+        res_get = fetch_historical_and_save_csv()
+        print(f"[startup] Resultado GET histórico: {res_get}")
+        print("[startup] Pipeline histórico finalizado.")
+    except Exception as e:
+        print(f"[startup] Error en pipeline histórico: {e}")
+
+
+@app.before_request
+def _kickoff_on_first_request():
+    """
+    Flask 3.x no tiene before_first_request.
+    Usamos before_request + Event para lanzarlo sólo una vez por proceso.
+    """
+    if PIPELINE_STARTED.is_set():
+        return
+    PIPELINE_STARTED.set()
+    Thread(target=_historical_pipeline_worker, daemon=True).start()
+
+
+# --- Ruta principal que muestra el dashboard
 @app.route('/')
 def mostrar_detecciones():
-    global fecha_ultimo_check, TOKEN, gallery_cache, PERSON_IMG_MAP
+    global fecha_ultimo_check, TOKEN, gallery_cache
+
     try:
         total_records_needed = int(request.args.get('records', TOTAL_RECORDS_NEEDED))
     except (ValueError, TypeError):
         total_records_needed = TOTAL_RECORDS_NEEDED
+
     if total_records_needed < PER_PAGE:
         total_records_needed = PER_PAGE
+
     if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or not TOKEN:
         if not obtener_nuevo_token():
             return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
+
+        # Cargar el caché de la galería (y descargar fotos si faltan)
         if not cargar_cache_galeria():
             return "<h1>Error de la API</h1><p>No se pudieron obtener los datos de la galería.</p>", 500
+
         all_searches = []
         headers = {"Authorization": f"Bearer {TOKEN}"}
+
         try:
             from_dt_utc = datetime.now(timezone.utc) - timedelta(days=1)
             to_dt_utc   = datetime.now(timezone.utc)
+
+            # Primer día del mes actual a las 01:00:00Z
             from_str = from_dt_utc.strftime("%Y-08-01T01:00:00.000Z")
             to_str   = to_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
             num_pages = math.ceil(total_records_needed / PER_PAGE)
+
             for page_num in range(1, num_pages + 1):
                 params = {
                     "from": from_str,
@@ -829,37 +1286,50 @@ def mostrar_detecciones():
                 response = requests.get(API_URL, headers=headers, params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
+
                 searches_on_page = data.get("searches", [])
                 all_searches.extend(searches_on_page)
+
                 if len(searches_on_page) < PER_PAGE:
                     break
+
             all_searches = all_searches[:total_records_needed]
+
             print(f"Total de registros obtenidos: {len(all_searches)}")
+
             with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara", "search_id", "camera_id", "ts_utc"])
+
                 for search in all_searches:
                     if not search.get("payload") or not search["payload"].get("image"):
                         continue
+
                     original_filename = search["payload"]["image"].get("originalFilename")
                     ts_raw = search["result"]["image"]["time"]
                     camera_obj = (search.get("payload", {}).get("camera", {}) or {})
                     camera_name = camera_obj.get("name", "")
                     camera_id = camera_obj.get("id", "")
                     search_id = search.get("id", "")
-                    entry = gallery_cache.get(original_filename, {})
-                    metadata = entry.get("metadata", {}) if entry else {}
+
+                    metadata = gallery_cache.get(original_filename, {})
                     person_name = metadata.get("name", "Nombre Desconocido")
+
                     try:
                         dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
+
                         dt_local = dt_utc - timedelta(hours=5)
                         fecha_str = dt_local.date().isoformat()
                         hora_str  = dt_local.strftime("%H:%M:%S")
+
                         ts_iso_z = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
                         writer.writerow([fecha_str, hora_str, person_name, 1, camera_name, search_id, camera_id, ts_iso_z])
                     except (ValueError, IndexError, TypeError):
                         continue
+
             fecha_ultimo_check = datetime.now()
+
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 print("Token expirado. Intentando obtener uno nuevo...")
@@ -874,7 +1344,9 @@ def mostrar_detecciones():
         except Exception as e:
             error_message = f"Ocurrió un error inesperado: {e}"
             return f"<h1>Error</h1><p>{error_message}</p>", 500
+
     registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
+
     last_ts = None
     for r in registros:
         f = r.get("fecha") or ""
@@ -889,43 +1361,60 @@ def mostrar_detecciones():
             except Exception:
                 pass
     last_ts_iso = last_ts.isoformat() if last_ts else ""
+
+    # Cobertura de galería
     gallery_names = set()
     try:
         for meta in (gallery_cache or {}).values():
-            name = (meta or {}).get("metadata", {}).get("name")
+            name = (meta or {}).get("name")
             if name:
                 gallery_names.add(name)
     except Exception:
         pass
+
     recognized_names = set(personas_ordenadas or [])
     recognized_in_gallery = len(recognized_names.intersection(gallery_names))
     total_gallery_persons = len(gallery_names)
     percent_gallery = (recognized_in_gallery / total_gallery_persons * 100.0) if total_gallery_persons else 0.0
+
     hoy_iso = datetime.now().date().isoformat()
     ingresos_hoy = sum((r.get("conteo", 0) or 0) for r in registros if r.get("fecha") == hoy_iso)
+
+    # datos del CSV histórico para el pie
+    pie_date, pie_labels, pie_data = leer_csv_historico(HIST_CSV_FILE)
+
     html_dashboard = construir_html(
         registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total,
         total_records_needed, last_ts_iso,
+        # Cards:
         percent_gallery, recognized_in_gallery, total_gallery_persons, ingresos_hoy,
-        PERSON_IMG_MAP
+        # Pie:
+        pie_date or "", pie_labels or [], pie_data or []
     )
+
     return render_template_string(html_dashboard)
+
 
 def obtener_imagenes_galeria():
     global TOKEN
+
     if not TOKEN:
         if not obtener_nuevo_token():
             print("Error: No se pudo obtener un token de autenticación.")
             return
+
     gallery_url = "https://dashboard-api.verifyfaces.com/companies/54/galleries/531"
     headers = {"Authorization": f"Bearer {TOKEN}"}
     params = {"perPage": 100, "page": 1}
+
     try:
         print("Haciendo llamada a la API de la galería...")
         response = requests.get(gallery_url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
+
         data = response.json()
-        print("Respuesta de la API de la galería:")
+        print("Respuesta de la API de la galería:", bool(data))
+
     except requests.exceptions.HTTPError as e:
         print(f"Error HTTP al obtener imágenes: {e.response.status_code} - {e.response.text}")
     except requests.exceptions.RequestException as e:
@@ -933,6 +1422,9 @@ def obtener_imagenes_galeria():
     except Exception as e:
         print(f"Ocurrió un error inesperado: {e}")
 
+
 if __name__ == '__main__':
+    # En Render normalmente no se ejecuta este bloque (Gunicorn importa app:app),
+    # pero lo dejamos por compatibilidad local.
     obtener_imagenes_galeria()
     app.run(debug=True)
