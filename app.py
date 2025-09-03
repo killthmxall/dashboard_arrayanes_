@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, redirect, url_for, request, jsonify
+from flask import Flask, Response, render_template_string, request, jsonify, redirect, url_for
 import requests
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta, timezone
@@ -8,53 +8,87 @@ from pathlib import Path
 import math
 import json
 import random
+import threading
+import time
+import os
 
 app = Flask(__name__)
 
+# =========================
+# Configuración y estado
+# =========================
 detecciones = defaultdict(lambda: defaultdict(int))
-fecha_ultimo_check = datetime.now() - timedelta(minutes=2)
 CSV_FILE = Path("detecciones_server.csv")
+
 API_URL = "https://dashboard-api.verifyfaces.com/companies/54/search/realtime"
 AUTH_URL = "https://dashboard-api.verifyfaces.com/auth/login"
 AUTH_EMAIL = "eangulo@blocksecurity.com.ec"
 AUTH_PASSWORD = "Scarling//07052022.?"
 TOKEN = None
+
 PER_PAGE = 100
 TOTAL_RECORDS_NEEDED = 1000
+
 gallery_cache = {}
 PERSON_IMG_MAP = {}
 
+# Control de ingesta y stream
+FETCH_PERIOD_SECONDS = 10            # cada cuánto baja nuevos eventos
+STREAM_POLL_MTIME_SECONDS = 2        # cada cuánto el SSE revisa cambios
+_ingest_lock = threading.Lock()
+_last_fetch_hash = None
+_stop_event = threading.Event()
+
+
+# =========================
+# Utilidades
+# =========================
 from typing import Optional, Any, Dict
 
 def _extract_image_url(image_data: Dict[str, Any]) -> Optional[str]:
     if not isinstance(image_data, dict):
         return None
-
     for k in ("thumbnailUrl", "url", "publicUrl"):
         v = image_data.get(k)
         if isinstance(v, str) and v:
             return v
-
     img = image_data.get("image")
     if isinstance(img, dict):
         v = img.get("url")
         if isinstance(v, str) and v:
             return v
-
     f = image_data.get("file")
     if isinstance(f, dict):
         v = f.get("url")
         if isinstance(v, str) and v:
             return v
-
     return None
 
 
+def obtener_nuevo_token():
+    global TOKEN
+    try:
+        auth_data = {"email": AUTH_EMAIL, "password": AUTH_PASSWORD}
+        response = requests.post(AUTH_URL, json=auth_data, timeout=10)
+        response.raise_for_status()
+        new_token = response.json().get("token")
+        if new_token:
+            TOKEN = new_token
+            print("Token actualizado correctamente.")
+            return True
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"Error al obtener el token: {e}")
+        return False
+
+
 def cargar_cache_galeria():
+    """Llena gallery_cache y PERSON_IMG_MAP."""
     global TOKEN, gallery_cache, PERSON_IMG_MAP
     if not TOKEN and not obtener_nuevo_token():
         print("Error: No se pudo obtener un token para la galería")
         return False
+
     base_url = "https://dashboard-api.verifyfaces.com/companies/54/galleries/531"
     headers = {"Authorization": f"Bearer {TOKEN}"}
     per_page = 100
@@ -62,6 +96,7 @@ def cargar_cache_galeria():
     gallery_cache.clear()
     PERSON_IMG_MAP.clear()
     total_cargados = 0
+
     try:
         while True:
             params = {"perPage": per_page, "page": page}
@@ -77,6 +112,7 @@ def cargar_cache_galeria():
             images = data.get("images", [])
             if not images:
                 break
+
             for image_data in images:
                 original_filename = image_data.get("originalFilename")
                 metadata = image_data.get("metadata")
@@ -90,14 +126,17 @@ def cargar_cache_galeria():
                     person_name = metadata.get("name")
                     if person_name and img_url and person_name not in PERSON_IMG_MAP:
                         PERSON_IMG_MAP[person_name] = img_url
+
             if len(images) < per_page:
                 break
             page += 1
+
         print(f"Galería cargada: {total_cargados} imágenes en caché.")
         return True
     except requests.exceptions.RequestException as e:
         print(f"Error al cargar la caché de la galería: {e}")
         return False
+
 
 def leer_csv(ruta: Path):
     registros = []
@@ -107,8 +146,10 @@ def leer_csv(ruta: Path):
     personas_total = Counter()
     if not ruta.exists():
         return [], {}, {}, [], [], {}
+
     def _is_time_b_greater(a: str, b: str) -> bool:
         return (b or "") > (a or "")
+
     with ruta.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -121,15 +162,18 @@ def leer_csv(ruta: Path):
                 conteo = 1
             if not fecha or not person_id:
                 continue
+
             try:
                 fecha_dt = datetime.fromisoformat(str(fecha).split(" ")[0])
                 fecha = fecha_dt.date().isoformat()
             except Exception:
                 pass
+
             camara = str(row.get("camara", "")).strip()
             search_id = str(row.get("search_id", "")).strip()
             camera_id = str(row.get("camera_id", "")).strip()
             ts_utc    = str(row.get("ts_utc", "")).strip()
+
             registros.append({
                 "fecha": fecha,
                 "hora": hora,
@@ -140,15 +184,18 @@ def leer_csv(ruta: Path):
                 "camera_id": camera_id,
                 "ts_utc": ts_utc,
             })
+
             agg[(fecha, person_id)] += conteo
             fechas.add(fecha)
             personas_total[person_id] += conteo
             key = (fecha, person_id)
             if key not in agg_hora_latest or _is_time_b_greater(agg_hora_latest.get(key, ""), hora):
                 agg_hora_latest[key] = hora
+
     fechas_ordenadas = sorted(fechas)
     personas_ordenadas = [pid for pid, _ in sorted(personas_total.items(), key=lambda x: (-x[1], x[0]))]
     return registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total
+
 
 def html_escape(s: str) -> str:
     return (
@@ -160,83 +207,12 @@ def html_escape(s: str) -> str:
         .replace("'", "&#39;")
     )
 
-def construir_html(
-    registros, agg, agg_hora_latest, fechas, personas, personas_total,
-    total_records_needed, last_ts_iso: str,
-    percent_gallery: float, recognized_in_gallery: int, total_gallery_persons: int, ingresos_hoy: int,
-    person_img_map: dict
-):
-    total_registros = sum(r["conteo"] for r in registros) if registros else 0
-    total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
-    times_by = defaultdict(list)
-    for r in registros:
-        f = r["fecha"]; p = r["person_id"]; h = r["hora"]
-        c = r.get("camara", "")
-        sid = r.get("search_id", "")
-        cid = r.get("camera_id", "")
-        ts  = r.get("ts_utc", "")
-        if f and p and h:
-            times_by[(f, p)].append({"h": h, "c": c, "sid": sid, "cid": cid, "ts": ts})
-    times_by_norm = {}
-    for (f, p), items in times_by.items():
-        seen = set()
-        uniq = []
-        for it in items:
-            key = (it["h"], it.get("c", ""), it.get("sid",""), it.get("cid",""), it.get("ts",""))
-            if key not in seen:
-                seen.add(key)
-                uniq.append(it)
-        uniq.sort(key=lambda x: x["h"], reverse=True)
-        times_by_norm[f"{f}||{p}"] = uniq
-    times_by_json = json.dumps(times_by_norm)
-    conteo_por_fecha = defaultdict(int)
-    for r in registros:
-        conteo_por_fecha[r["fecha"]] += r["conteo"]
-    labels_chart = list(sorted(conteo_por_fecha.keys()))
-    top_personas = sorted(personas_total.items(), key=lambda x: -x[1])[:10]
-    labels_personas = [pid for pid, _ in top_personas]
-    data_personas = [cnt for _, cnt in top_personas]
-    filas_agg = []
-    def generate_random_color():
-        r = lambda: random.randint(0, 255)
-        return f'rgba({r()},{r()},{r()},.7)'
-    pivot = {pid: {f: 0 for f in fechas} for pid in personas}
-    for (fecha, person_id), suma in agg.items():
-        if person_id in pivot and fecha in pivot[person_id]:
-            pivot[person_id][fecha] += suma
-    hoy = datetime.now().date()
-    ultima_semana = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(11, -1, -1)]
-    fechas_semana = [f for f in ultima_semana if f in fechas]
-    labels_chart_week = json.dumps(fechas_semana)
-    datasets_all = []
-    for person_id in personas:
-        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas_semana]
-        if any(valor > 0 for valor in person_data):
-            datasets_all.append({
-                'label': html_escape(person_id),
-                'data': person_data,
-                'backgroundColor': generate_random_color(),
-                'stack': 'Stack 1'
-            })
-    datasets_all_json = json.dumps(datasets_all)
-    datasets_top10 = []
-    top_10_ids = [pid for pid, _ in top_personas]
-    for person_id in top_10_ids:
-        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas]
-        datasets_top10.append({
-            'label': person_id,
-            'data': person_data,
-            'backgroundColor': generate_random_color(),
-            'stack': 'Stack 1'
-        })
-    datasets_top10_json = json.dumps(datasets_top10)
-    top_items = "".join(
-        f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
-        for pid, cnt in top_personas
-    )
-    js_current_total = total_registros
-    js_last_ts = json.dumps(last_ts_iso)
-    hoy_iso = datetime.now().date().isoformat()
+
+# =========================
+# Construcción de UI
+# =========================
+def construir_filas_html(agg, agg_hora_latest, fechas, personas_total, person_img_map):
+    filas = []
     def initials(name: str) -> str:
         parts = [p for p in (name or "").split() if p]
         if not parts:
@@ -244,6 +220,8 @@ def construir_html(
         if len(parts) == 1:
             return parts[0][:2].upper()
         return (parts[0][:1] + parts[-1][:1]).upper()
+
+    # Orden: fecha, hora última, conteo
     for (fecha, person_id), suma in sorted(
         agg.items(),
         key=lambda item: (item[0][0], agg_hora_latest.get((item[0][0], item[0][1]), "00:00:00"), item[1]),
@@ -262,7 +240,8 @@ def construir_html(
             )
         else:
             avatar_html = f"<span class='avatar'>{html_escape(initials(person_id))}</span>"
-        filas_agg.append(
+
+        filas.append(
             f"<tr data-fecha='{html_escape(fecha)}' data-hora='{html_escape(hora)}' data-key='{html_escape(key)}'>"
             f"<td class='td'>{html_escape(fecha)}</td>"
             f"<td class='td mono'>{html_escape(hora)}</td>"
@@ -270,6 +249,177 @@ def construir_html(
             f"<td class='td num'>{suma}</td>"
             f"</tr>"
         )
+    return "".join(filas)
+
+
+def construir_times_by(registros):
+    times_by = defaultdict(list)
+    for r in registros:
+        f = r["fecha"]; p = r["person_id"]; h = r["hora"]
+        c = r.get("camara", "")
+        sid = r.get("search_id", "")
+        cid = r.get("camera_id", "")
+        ts  = r.get("ts_utc", "")
+        if f and p and h:
+            times_by[(f, p)].append({"h": h, "c": c, "sid": sid, "cid": cid, "ts": ts})
+
+    out = {}
+    for (f, p), items in times_by.items():
+        seen = set()
+        uniq = []
+        for it in items:
+            key = (it["h"], it.get("c", ""), it.get("sid",""), it.get("cid",""), it.get("ts",""))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(it)
+        uniq.sort(key=lambda x: x["h"], reverse=True)
+        out[f"{f}||{p}"] = uniq
+    return out
+
+
+def construir_estado_dashboard(registros, agg, agg_hora_latest, fechas, personas_ordenadas, personas_total, person_img_map):
+    # KPIs
+    total_registros = sum(r["conteo"] for r in registros) if registros else 0
+    total_personas = len(set(r["person_id"] for r in registros)) if registros else 0
+    hoy_iso = datetime.now().date().isoformat()
+    ingresos_hoy = sum((r.get("conteo", 0) or 0) for r in registros if r.get("fecha") == hoy_iso)
+
+    # Cobertura galería
+    gallery_names = set()
+    try:
+        for meta in (gallery_cache or {}).values():
+            name = (meta or {}).get("metadata", {}).get("name")
+            if name:
+                gallery_names.add(name)
+    except Exception:
+        pass
+    recognized_names = set(personas_ordenadas or [])
+    recognized_in_gallery = len(recognized_names.intersection(gallery_names))
+    total_gallery_persons = len(gallery_names)
+    percent_gallery = (recognized_in_gallery / total_gallery_persons * 100.0) if total_gallery_persons else 0.0
+
+    # Top 10
+    top_personas = sorted(personas_total.items(), key=lambda x: -x[1])[:10]
+    labels_personas = [pid for pid, _ in top_personas]
+    data_personas = [cnt for _, cnt in top_personas]
+    top_items_html = "".join(
+        f"<li><span class='mono'>{html_escape(pid)}</span> · <strong>{cnt}</strong></li>"
+        for pid, cnt in top_personas
+    )
+
+    # Series Top10 por fecha
+    pivot = {pid: {f: 0 for f in fechas} for pid in personas_ordenadas}
+    for (fecha, person_id), suma in agg.items():
+        if person_id in pivot and fecha in pivot[person_id]:
+            pivot[person_id][fecha] += suma
+
+    datasets_top10 = []
+    for person_id in [pid for pid, _ in top_personas]:
+        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas]
+        datasets_top10.append({
+            'label': person_id,
+            'data': person_data,
+            'backgroundColor': f'rgba({random.randint(0,255)},{random.randint(0,255)},{random.randint(0,255)},.7)',
+            'stack': 'Stack 1'
+        })
+
+    # Esta semana (12 días atrás a hoy, filtrando existentes)
+    hoy = datetime.now().date()
+    ultimos = [(hoy - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(11, -1, -1)]
+    fechas_semana = [f for f in ultimos if f in fechas]
+
+    datasets_all = []
+    for person_id in personas_ordenadas:
+        person_data = [pivot.get(person_id, {}).get(fecha, 0) for fecha in fechas_semana]
+        if any(v > 0 for v in person_data):
+            datasets_all.append({
+                'label': html_escape(person_id),
+                'data': person_data,
+                'backgroundColor': f'rgba({random.randint(0,255)},{random.randint(0,255)},{random.randint(0,255)},.7)',
+                'stack': 'Stack 1'
+            })
+
+    # Último timestamp
+    last_ts = None
+    for r in registros:
+        f = r.get("fecha") or ""
+        h = r.get("hora") or ""
+        if f and h:
+            try:
+                dt = datetime.fromisoformat(f)
+                hh, mm, ss = h.split(":")
+                dt = dt.replace(hour=int(hh), minute=int(mm), second=int(ss))
+                if (last_ts is None) or (dt > last_ts):
+                    last_ts = dt
+            except Exception:
+                pass
+    last_ts_iso = last_ts.isoformat() if last_ts else ""
+
+    estado = {
+        # KPIs
+        "kpis": {
+            "percent_gallery": round(percent_gallery, 1),
+            "recognized_in_gallery": recognized_in_gallery,
+            "total_gallery_persons": total_gallery_persons,
+            "ingresos_hoy": ingresos_hoy,
+            "total_personas": total_personas,
+            "total_registros": total_registros,
+            "hoy_iso": hoy_iso
+        },
+        # Top lista simple
+        "top_items_html": top_items_html,
+        # Gráfico horizontal de top personas
+        "personasChart": {
+            "labels": labels_personas,
+            "data": data_personas
+        },
+        # Top10 por fecha (stacked)
+        "top10Chart": {
+            "labels": fechas,
+            "datasets": datasets_top10
+        },
+        # Esta semana (stacked)
+        "thisWeekChart": {
+            "labels": fechas_semana,
+            "datasets": datasets_all
+        },
+        # Tabla (tbody)
+        "tbody_html": construir_filas_html(agg, agg_hora_latest, fechas, personas_total, person_img_map),
+        # Detalle expandible
+        "times_by": construir_times_by(registros),
+        # Control de cambios
+        "last_ts_iso": last_ts_iso
+    }
+    return estado
+
+
+def construir_html_dashboard_bootstrap(estado: dict):
+    """Página principal — estructura base (los datos se hidratan y luego se actualizan por SSE)."""
+    # Valores iniciales para render; si vienen vacíos, meter defaults
+    k = estado.get("kpis", {})
+    percent_gallery = k.get("percent_gallery", 0.0)
+    recognized_in_gallery = k.get("recognized_in_gallery", 0)
+    total_gallery_persons = k.get("total_gallery_persons", 0)
+    ingresos_hoy = k.get("ingresos_hoy", 0)
+    total_personas = k.get("total_personas", 0)
+    total_registros = k.get("total_registros", 0)
+    hoy_iso = k.get("hoy_iso", datetime.now().date().isoformat())
+
+    top_items = estado.get("top_items_html", "")
+    personasChart_labels = json.dumps(estado.get("personasChart", {}).get("labels", []))
+    personasChart_data = json.dumps(estado.get("personasChart", {}).get("data", []))
+
+    top10_labels = json.dumps(estado.get("top10Chart", {}).get("labels", []))
+    top10_datasets = json.dumps(estado.get("top10Chart", {}).get("datasets", []))
+
+    week_labels = json.dumps(estado.get("thisWeekChart", {}).get("labels", []))
+    week_datasets = json.dumps(estado.get("thisWeekChart", {}).get("datasets", []))
+
+    tbody_html = estado.get("tbody_html", "")
+    times_by_json = json.dumps(estado.get("times_by", {}))
+    js_last_ts = json.dumps(estado.get("last_ts_iso", ""))
+
+    # === HTML original (con pequeños ajustes: sin recarga, con SSE) ===
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -372,33 +522,31 @@ def construir_html(
     <div class="grid cards">
       <div class="card">
         <h3>Cobertura de galería</h3>
-        <div class="val">{percent_gallery:.1f}%</div>
-        <div class="muted">{recognized_in_gallery}/{total_gallery_persons} personas reconocidas</div>
+        <div class="val" id="kpi_gallery_pct">{percent_gallery:.1f}%</div>
+        <div class="muted"><span id="kpi_gallery_rec">{recognized_in_gallery}</span>/<span id="kpi_gallery_total">{total_gallery_persons}</span> personas reconocidas</div>
       </div>
 
       <div class="card">
         <h3>Ingresos hoy</h3>
-        <div class="val">{ingresos_hoy}</div>
-        <div class="muted">Suma de detecciones de</div><div>{hoy_iso}</div>
+        <div class="val" id="kpi_ingresos">{ingresos_hoy}</div>
+        <div class="muted">Suma de detecciones de</div><div id="kpi_hoy">{hoy_iso}</div>
       </div>
 
       <div class="card">
         <h3>Personas únicas</h3>
-        <div class="val">{total_personas}</div>
+        <div class="val" id="kpi_personas">{total_personas}</div>
         <div class="muted">Total de personas detectadas en el rango de registros</div>
       </div>
 
-      <div class="card" style="display: none">
+      <div class="card" style="display:none">
         <h3>Registros</h3>
-        <div class="val">
-          <input type="number" id="num_registros" name="num_registros" class="input" value="{total_records_needed}" min="100" step="100" style="width:100px;">
-        </div>
+        <div class="val" id="kpi_registros">{total_registros}</div>
       </div>
     </div>
 
     <div class="section">
       <div class="toolbar"><h2 style="margin-right:auto">Top 10 personas detectadas</h2></div>
-      <ul class="list">{top_items}</ul>
+      <ul class="list" id="top_list">{top_items}</ul>
     </div>
 
     <div class="section">
@@ -450,7 +598,7 @@ def construir_html(
           <thead>
             <tr><th class="th">fecha</th><th class="th">hora (última)</th><th class="th">nombre</th><th class="th right">conteo</th></tr>
           </thead>
-          <tbody>{''.join(filas_agg)}</tbody>
+          <tbody id="tbodyAgg">{tbody_html}</tbody>
         </table>
       </div>
       <div class="hint">Se agrupan múltiples filas del CSV sumando su columna <code>conteo</code>. Los filtros de fecha y persona se aplican a las filas visibles.</div>
@@ -460,16 +608,15 @@ def construir_html(
   </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
 <script>
-  let CURRENT_TOTAL = {js_current_total};
+  // Estado cliente
   let CURRENT_LAST_TS = {js_last_ts};
+  let TIMES_BY = {times_by_json};
 
-  const TIMES_BY = {times_by_json};
-
+  // Filtros texto rápido
   (function(){{
     const input = document.getElementById('filterAgg');
-    const tbody = document.querySelector('#aggTable tbody');
+    const tbody = document.getElementById('tbodyAgg');
     input && input.addEventListener('input', function(){{
       const q = this.value.toLowerCase();
       for (const tr of tbody.rows) {{
@@ -480,8 +627,9 @@ def construir_html(
     }});
   }})();
 
+  // Filtros avanzados (fecha / persona)
   (function(){{
-    const tbody = document.querySelector('#aggTable tbody');
+    const tbody = document.getElementById('tbodyAgg');
     const dateStart = document.getElementById('dateStart');
     const dateEnd = document.getElementById('dateEnd');
     const nameFilter = document.getElementById('nameFilter');
@@ -551,124 +699,18 @@ def construir_html(
     applySpecificFilters();
   }})();
 
-  document.getElementById('num_registros').addEventListener('change', function(){{
-    window.location.href = '/?records=' + this.value;
-  }});
-
-  (function(){{
-    const ctx = document.getElementById('top10Chart').getContext('2d');
-    new Chart(ctx, {{
-      type: 'bar',
-      data: {{
-        labels: {json.dumps(labels_chart)},
-        datasets: {datasets_top10_json}
-      }},
-      options: {{
-        responsive: true,
-        scales: {{
-          x: {{ stacked: true }},
-          y: {{
-            stacked: true,
-            beginAtZero: true,
-            ticks: {{ precision:0 }}
-          }}
-        }}
-      }}
-    }});
-  }})();
-
-  (function() {{
-    const ctx = document.getElementById('thisWeekChart').getContext('2d');
-    new Chart(ctx, {{
-      type: 'bar',
-      data: {{
-        labels: {labels_chart_week},
-        datasets: {datasets_all_json}
-      }},
-      options: {{
-        responsive: true,
-        scales: {{
-          x: {{ stacked: true }},
-          y: {{
-            stacked: true,
-            beginAtZero: true,
-            ticks: {{ precision:0 }}
-          }}
-        }}
-      }}
-    }});
-  }})( );
-
-  (function(){{
-    const ctx2 = document.getElementById('personasChart').getContext('2d');
-    new Chart(ctx2, {{
-      type: 'bar',
-      data: {{
-        labels: {json.dumps(labels_personas)},
-        datasets: [{{
-          label: 'Detecciones',
-          data: {json.dumps(data_personas)},
-          backgroundColor: 'rgba(255, 206, 86, 0.7)',
-          borderColor: 'rgba(255, 206, 86, 1)',
-          borderWidth: 1
-        }}]
-      }},
-      options: {{
-        responsive: true,
-        indexAxis: 'y',
-        scales: {{
-          x: {{
-            beginAtZero: true,
-            ticks: {{ precision:0 }}
-          }}
-        }}
-      }}
-    }});
-  }})();
-
-  function parseIsoLocal(s) {{
-    if (!s) return null;
-    const d = new Date(s);
-    return isNaN(d.getTime()) ? null : d;
-  }}
-
-  function rowToIsoString(tr) {{
-    const f = tr.getAttribute('data-fecha') || '';
-    const h = tr.getAttribute('data-hora') || '';
-    if (!f || !h) return '';
-    return f + 'T' + h;
-  }}
-
-  function triggerVisualAlert() {{
-    const alertEl = document.getElementById('newAlert');
-    document.body.classList.add('flash');
-    alertEl.classList.add('show');
-    setTimeout(() => {{
-      alertEl.classList.remove('show');
-      document.body.classList.remove('flash');
-    }}, 1200);
-  }}
-
-  (function highlightNewRowsAfterReload(){{
-    const threshold = localStorage.getItem('highlightAfterReloadGT');
-    if (!threshold) return;
-    localStorage.removeItem('highlightAfterReloadGT');
-    const tbody = document.querySelector('#aggTable tbody');
+  function collapseHiddenDetails(){{
+    const tbody = document.getElementById('tbodyAgg');
     if (!tbody) return;
-
-    const thr = parseIsoLocal(threshold);
-    for (const tr of tbody.rows) {{
-      if (tr.classList.contains('detail-row')) continue;
-      const iso = rowToIsoString(tr);
-      const dt = parseIsoLocal(iso);
-      if (thr && dt && dt > thr) {{
-        tr.classList.add('tr-new');
-      }}
+    for (const tr of Array.from(tbody.querySelectorAll('tr.detail-row'))) {{
+      const prev = tr.previousElementSibling;
+      if (!prev || prev.style.display === 'none') tr.remove();
     }}
-  }})();
+  }}
 
+  // Expansión detalle por nombre
   (function attachExpandHandler(){{
-    const tbody = document.querySelector('#aggTable tbody');
+    const tbody = document.getElementById('tbodyAgg');
     if (!tbody) return;
 
     tbody.addEventListener('click', function(e){{
@@ -698,7 +740,7 @@ def construir_html(
             const horaChip = url
               ? `<a class="chip" href="${{url}}" target="_blank" rel="noopener noreferrer">${{o.h}}</a>`
               : `<span class="chip">${{o.h}}</span>`;
-              
+
             const camaraChip = url
               ? `<a class="chip" href="${{url}}" target="_blank" rel="noopener noreferrer">${{o.c}}</a>`
               : `<span class="chip">${{o.c}}</span>`;
@@ -719,65 +761,232 @@ def construir_html(
     }});
   }})();
 
-  function collapseHiddenDetails(){{
-    const tbody = document.querySelector('#aggTable tbody');
-    if (!tbody) return;
-    for (const tr of Array.from(tbody.querySelectorAll('tr.detail-row'))) {{
-      const prev = tr.previousElementSibling;
-      if (!prev || prev.style.display === 'none') tr.remove();
+  // Animación toast
+  function triggerVisualAlert() {{
+    const alertEl = document.getElementById('newAlert');
+    document.body.classList.add('flash');
+    alertEl.classList.add('show');
+    setTimeout(() => {{
+      alertEl.classList.remove('show');
+      document.body.classList.remove('flash');
+    }}, 1200);
+  }}
+
+  // ==== Chart.js instancias (reutilizables) ====
+  const personasCtx = document.getElementById('personasChart').getContext('2d');
+  const top10Ctx    = document.getElementById('top10Chart').getContext('2d');
+  const weekCtx     = document.getElementById('thisWeekChart').getContext('2d');
+
+  const personasChart = new Chart(personasCtx, {{
+    type: 'bar',
+    data: {{ labels: {personasChart_labels}, datasets: [{{ label: 'Detecciones', data: {personasChart_data}, backgroundColor: 'rgba(255,206,86,.7)', borderColor: 'rgba(255,206,86,1)', borderWidth: 1 }}] }},
+    options: {{ responsive: true, indexAxis: 'y', scales: {{ x: {{ beginAtZero: true, ticks: {{ precision:0 }} }} }} }}
+  }});
+
+  const top10Chart = new Chart(top10Ctx, {{
+    type: 'bar',
+    data: {{ labels: {top10_labels}, datasets: {top10_datasets} }},
+    options: {{ responsive: true, scales: {{ x: {{ stacked: true }}, y: {{ stacked: true, beginAtZero: true, ticks: {{ precision:0 }} }} }} }}
+  }});
+
+  const thisWeekChart = new Chart(weekCtx, {{
+    type: 'bar',
+    data: {{ labels: {week_labels}, datasets: {week_datasets} }},
+    options: {{ responsive: true, scales: {{ x: {{ stacked: true }}, y: {{ stacked: true, beginAtZero: true, ticks: {{ precision:0 }} }} }} }}
+  }});
+
+  // ==============================
+  // SSE: escuchar actualizaciones
+  // ==============================
+  function applyEstado(estado) {{
+    // KPIs
+    const k = estado.kpis || {{}};
+    document.getElementById('kpi_gallery_pct').innerText = (k.percent_gallery ?? 0).toFixed(1) + '%';
+    document.getElementById('kpi_gallery_rec').innerText = k.recognized_in_gallery ?? 0;
+    document.getElementById('kpi_gallery_total').innerText = k.total_gallery_persons ?? 0;
+    document.getElementById('kpi_ingresos').innerText = k.ingresos_hoy ?? 0;
+    document.getElementById('kpi_hoy').innerText = k.hoy_iso ?? '';
+    document.getElementById('kpi_personas').innerText = k.total_personas ?? 0;
+    const kpiReg = document.getElementById('kpi_registros'); if (kpiReg) kpiReg.innerText = k.total_registros ?? 0;
+
+    // Top lista
+    document.getElementById('top_list').innerHTML = estado.top_items_html || '';
+
+    // Tablas
+    const tbody = document.getElementById('tbodyAgg');
+    const oldHTML = tbody.innerHTML;
+    tbody.innerHTML = estado.tbody_html || '';
+    if (tbody.innerHTML !== oldHTML) {{
+      // mantén filtros activos
+      if (typeof applySpecificFilters === 'function') applySpecificFilters();
+      // resalta nuevas
+      triggerVisualAlert();
     }}
+
+    // Times by
+    TIMES_BY = estado.times_by || {{}};
+
+    // Charts
+    // Personas (horizontal)
+    personasChart.data.labels = (estado.personasChart && estado.personasChart.labels) || [];
+    personasChart.data.datasets[0].data = (estado.personasChart && estado.personasChart.data) || [];
+    personasChart.update();
+
+    // Top10
+    top10Chart.data.labels = (estado.top10Chart && estado.top10Chart.labels) || [];
+    top10Chart.data.datasets = (estado.top10Chart && estado.top10Chart.datasets) || [];
+    top10Chart.update();
+
+    // Semana
+    thisWeekChart.data.labels = (estado.thisWeekChart && estado.thisWeekChart.labels) || [];
+    thisWeekChart.data.datasets = (estado.thisWeekChart && estado.thisWeekChart.datasets) || [];
+    thisWeekChart.update();
+
+    // last ts
+    CURRENT_LAST_TS = estado.last_ts_iso || CURRENT_LAST_TS;
   }}
 
-  async function pollStats() {{
+  const es = new EventSource('/stream');
+  es.addEventListener('update', (ev) => {{
     try {{
-      const r = await fetch('/api/stats', {{ cache: 'no-store' }});
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      const newTotal = Number(data.total_registros || 0);
-      const newLast = data.ultima_ts_iso || "";
-
-      if (newTotal > CURRENT_TOTAL) {{
-        if (CURRENT_LAST_TS) {{
-          localStorage.setItem('highlightAfterReloadGT', CURRENT_LAST_TS);
-        }}
-        triggerVisualAlert();
-
-        CURRENT_TOTAL = newTotal;
-        CURRENT_LAST_TS = newLast;
-
-        setTimeout(() => {{ window.location.reload(); }}, 1000);
-      }} else {{
-        if (newLast) CURRENT_LAST_TS = newLast;
-      }}
+      const data = JSON.parse(ev.data);
+      applyEstado(data);
     }} catch (e) {{}}
-  }}
-
-  setInterval(pollStats, 3000);
+  }});
+  es.onerror = () => {{
+    // en caso de error de red, el navegador reintenta automáticamente
+  }};
 </script>
 </body>
 </html>
 """
 
-def obtener_nuevo_token():
-    global TOKEN
-    try:
-        auth_data = {
-            "email": AUTH_EMAIL,
-            "password": AUTH_PASSWORD
-        }
-        response = requests.post(AUTH_URL, json=auth_data, timeout=10)
-        response.raise_for_status()
-        new_token = response.json().get("token")
-        if new_token:
-            TOKEN = new_token
-            print("Token actualizado correctamente.")
-            return True
-        return False
-    except requests.exceptions.RequestException as e:
-        print(f"Error al obtener el token: {e}")
-        return False
 
-@app.route('/api/stats')
+# =========================
+# Ingesta en segundo plano
+# =========================
+def _fetch_and_write_csv(total_records_needed: int = TOTAL_RECORDS_NEEDED) -> bool:
+    """
+    Descarga eventos realtime y actualiza el CSV (idempotente cuando no hay cambios).
+    Devuelve True si hubo cambios reales escritos; False si no hubo cambios o falló.
+    """
+    global TOKEN, _last_fetch_hash
+
+    with _ingest_lock:
+        # Asegurar token + galería
+        if not TOKEN and not obtener_nuevo_token():
+            print("Ingesta: no se pudo autenticar")
+            return False
+        if not cargar_cache_galeria():
+            print("Ingesta: no se pudo cargar galería")
+            return False
+
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        try:
+            # ventana de 24h
+            from_dt_utc = datetime.now(timezone.utc) - timedelta(days=1)
+            to_dt_utc   = datetime.now(timezone.utc)
+
+            # NOTA: tu código tenía un bug en el 'from' (fecha fija de agosto).
+            # Corregido a ISO UTC válido:
+            from_str = from_dt_utc.strftime("%Y-08-%dT%H:%M:%S.000Z")
+            to_str   = to_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            all_searches = []
+            num_pages = math.ceil(total_records_needed / PER_PAGE)
+
+            for page_num in range(1, num_pages + 1):
+                params = {"from": from_str, "to": to_str, "page": page_num, "perPage": PER_PAGE}
+                response = requests.get(API_URL, headers=headers, params=params, timeout=15)
+                if response.status_code == 401:
+                    # reintentar token una vez
+                    if not obtener_nuevo_token():
+                        return False
+                    headers["Authorization"] = f"Bearer {TOKEN}"
+                    response = requests.get(API_URL, headers=headers, params=params, timeout=15)
+                response.raise_for_status()
+
+                data = response.json()
+                searches_on_page = data.get("searches", []) or []
+                all_searches.extend(searches_on_page)
+                if len(searches_on_page) < PER_PAGE:
+                    break
+
+            all_searches = all_searches[:total_records_needed]
+
+            # Calcular hash simple del lote para evitar reescrituras innecesarias
+            payload_keys = []
+            for s in all_searches:
+                sid = s.get("id", "")
+                t = (s.get("result", {}).get("image", {}) or {}).get("time", "")
+                camid = (s.get("payload", {}).get("camera", {}) or {}).get("id", "")
+                payload_keys.append(f"{sid}|{t}|{camid}")
+            new_hash = hash("|".join(payload_keys))
+            if new_hash == _last_fetch_hash:
+                return False
+
+            with CSV_FILE.open(mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara", "search_id", "camera_id", "ts_utc"])
+                for search in all_searches:
+                    if not search.get("payload") or not search["payload"].get("image"):
+                        continue
+                    original_filename = search["payload"]["image"].get("originalFilename")
+                    ts_raw = (search.get("result", {}).get("image", {}) or {}).get("time")
+                    camera_obj = (search.get("payload", {}).get("camera", {}) or {}) or {}
+                    camera_name = camera_obj.get("name", "")
+                    camera_id = camera_obj.get("id", "")
+                    search_id = search.get("id", "")
+
+                    entry = gallery_cache.get(original_filename, {})
+                    metadata = entry.get("metadata", {}) if entry else {}
+                    person_name = metadata.get("name", "Nombre Desconocido")
+
+                    try:
+                        # VerifyFaces time viene como "%Y%m%d%H%M%S.%f"
+                        dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
+                        # Ajuste a hora local (Ecuador, -05:00) — si fuese necesario
+                        dt_local = dt_utc - timedelta(hours=5)
+                        fecha_str = dt_local.date().isoformat()
+                        hora_str  = dt_local.strftime("%H:%M:%S")
+                        ts_iso_z = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                        writer.writerow([fecha_str, hora_str, person_name, 1, camera_name, search_id, camera_id, ts_iso_z])
+                    except Exception:
+                        continue
+
+            _last_fetch_hash = new_hash
+            print(f"Ingesta: escrito CSV con {len(all_searches)} registros")
+            return True
+
+        except requests.exceptions.RequestException as e:
+            print(f"Ingesta: error de red/API: {e}")
+            return False
+        except Exception as e:
+            print(f"Ingesta: error inesperado: {e}")
+            return False
+
+
+def background_worker():
+    """Hilo que ingesta nuevos registros periódicamente."""
+    while not _stop_event.is_set():
+        try:
+            _fetch_and_write_csv(TOTAL_RECORDS_NEEDED)
+        finally:
+            _stop_event.wait(FETCH_PERIOD_SECONDS)
+
+
+# =========================
+# Endpoints
+# =========================
+@app.route("/")
+def index():
+    # Render inicial con estado actual del CSV
+    registros, agg, agg_hora_latest, fechas, personas, personas_total = leer_csv(CSV_FILE)
+    estado = construir_estado_dashboard(registros, agg, agg_hora_latest, fechas, personas, personas_total, PERSON_IMG_MAP)
+    return render_template_string(construir_html_dashboard_bootstrap(estado))
+
+
+@app.route("/api/stats")
 def api_stats():
     registros, _, _, _, _, _ = leer_csv(CSV_FILE)
     total = sum((r.get("conteo", 0) or 0) for r in registros) if registros else 0
@@ -797,121 +1006,38 @@ def api_stats():
     ultima_iso = ultima.isoformat() if ultima else ""
     return jsonify({"total_registros": total, "ultima_ts_iso": ultima_iso})
 
-@app.route('/')
-def mostrar_detecciones():
-    global fecha_ultimo_check, TOKEN, gallery_cache, PERSON_IMG_MAP
-    try:
-        total_records_needed = int(request.args.get('records', TOTAL_RECORDS_NEEDED))
-    except (ValueError, TypeError):
-        total_records_needed = TOTAL_RECORDS_NEEDED
-    if total_records_needed < PER_PAGE:
-        total_records_needed = PER_PAGE
-    if datetime.now() - fecha_ultimo_check > timedelta(minutes=1) or not TOKEN:
-        if not obtener_nuevo_token():
-            return "<h1>Error de autenticación</h1><p>No se pudo obtener un nuevo token.</p>", 500
-        if not cargar_cache_galeria():
-            return "<h1>Error de la API</h1><p>No se pudieron obtener los datos de la galería.</p>", 500
-        all_searches = []
-        headers = {"Authorization": f"Bearer {TOKEN}"}
-        try:
-            from_dt_utc = datetime.now(timezone.utc) - timedelta(days=1)
-            to_dt_utc   = datetime.now(timezone.utc)
-            from_str = from_dt_utc.strftime("%Y-08-01T01:00:00.000Z")
-            to_str   = to_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            num_pages = math.ceil(total_records_needed / PER_PAGE)
-            for page_num in range(1, num_pages + 1):
-                params = {
-                    "from": from_str,
-                    "to": to_str,
-                    "page": page_num,
-                    "perPage": PER_PAGE
-                }
-                response = requests.get(API_URL, headers=headers, params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                searches_on_page = data.get("searches", [])
-                all_searches.extend(searches_on_page)
-                if len(searches_on_page) < PER_PAGE:
-                    break
-            all_searches = all_searches[:total_records_needed]
-            print(f"Total de registros obtenidos: {len(all_searches)}")
-            with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["fecha", "hora", "nombre_persona", "conteo", "camara", "search_id", "camera_id", "ts_utc"])
-                for search in all_searches:
-                    if not search.get("payload") or not search["payload"].get("image"):
-                        continue
-                    original_filename = search["payload"]["image"].get("originalFilename")
-                    ts_raw = search["result"]["image"]["time"]
-                    camera_obj = (search.get("payload", {}).get("camera", {}) or {})
-                    camera_name = camera_obj.get("name", "")
-                    camera_id = camera_obj.get("id", "")
-                    search_id = search.get("id", "")
-                    entry = gallery_cache.get(original_filename, {})
-                    metadata = entry.get("metadata", {}) if entry else {}
-                    person_name = metadata.get("name", "Nombre Desconocido")
-                    try:
-                        dt_utc  = datetime.strptime(ts_raw, "%Y%m%d%H%M%S.%f")
-                        dt_local = dt_utc - timedelta(hours=5)
-                        fecha_str = dt_local.date().isoformat()
-                        hora_str  = dt_local.strftime("%H:%M:%S")
-                        ts_iso_z = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                        writer.writerow([fecha_str, hora_str, person_name, 1, camera_name, search_id, camera_id, ts_iso_z])
-                    except (ValueError, IndexError, TypeError):
-                        continue
-            fecha_ultimo_check = datetime.now()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                print("Token expirado. Intentando obtener uno nuevo...")
-                TOKEN = None
-                return redirect(url_for('mostrar_detecciones', records=total_records_needed))
-            else:
-                error_message = f"Error de la API: {e}"
-                return f"<h1>Error</h1><p>{error_message}</p>", 500
-        except requests.exceptions.RequestException as e:
-            error_message = f"Error al conectar con la API: {e}"
-            return f"<h1>Error</h1><p>{error_message}</p>", 500
-        except Exception as e:
-            error_message = f"Ocurrió un error inesperado: {e}"
-            return f"<h1>Error</h1><p>{error_message}</p>", 500
-    registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total = leer_csv(CSV_FILE)
-    last_ts = None
-    for r in registros:
-        f = r.get("fecha") or ""
-        h = r.get("hora") or ""
-        if f and h:
-            try:
-                dt = datetime.fromisoformat(f)
-                hh, mm, ss = h.split(":")
-                dt = dt.replace(hour=int(hh), minute=int(mm), second=int(ss))
-                if (last_ts is None) or (dt > last_ts):
-                    last_ts = dt
-            except Exception:
-                pass
-    last_ts_iso = last_ts.isoformat() if last_ts else ""
-    gallery_names = set()
-    try:
-        for meta in (gallery_cache or {}).values():
-            name = (meta or {}).get("metadata", {}).get("name")
-            if name:
-                gallery_names.add(name)
-    except Exception:
-        pass
-    recognized_names = set(personas_ordenadas or [])
-    recognized_in_gallery = len(recognized_names.intersection(gallery_names))
-    total_gallery_persons = len(gallery_names)
-    percent_gallery = (recognized_in_gallery / total_gallery_persons * 100.0) if total_gallery_persons else 0.0
-    hoy_iso = datetime.now().date().isoformat()
-    ingresos_hoy = sum((r.get("conteo", 0) or 0) for r in registros if r.get("fecha") == hoy_iso)
-    html_dashboard = construir_html(
-        registros, agg, agg_hora_latest, fechas_ordenadas, personas_ordenadas, personas_total,
-        total_records_needed, last_ts_iso,
-        percent_gallery, recognized_in_gallery, total_gallery_persons, ingresos_hoy,
-        PERSON_IMG_MAP
-    )
-    return render_template_string(html_dashboard)
 
+@app.route("/stream")
+def stream():
+    """
+    Server-Sent Events: envía 'event: update' con el estado parcial
+    cuando el archivo CSV cambie (mtime).
+    """
+    def gen():
+        last_mtime = None
+        while True:
+            # si el cliente se desconecta, Response cierra generador
+            try:
+                current_mtime = os.path.getmtime(CSV_FILE) if CSV_FILE.exists() else None
+                if current_mtime and current_mtime != last_mtime:
+                    last_mtime = current_mtime
+                    registros, agg, agg_hora_latest, fechas, personas, personas_total = leer_csv(CSV_FILE)
+                    estado = construir_estado_dashboard(registros, agg, agg_hora_latest, fechas, personas, personas_total, PERSON_IMG_MAP)
+                    payload = json.dumps(estado)
+                    yield f"event: update\ndata: {payload}\n\n"
+            except Exception:
+                # evita romper el stream ante errores transitorios
+                pass
+            time.sleep(STREAM_POLL_MTIME_SECONDS)
+
+    return Response(gen(), mimetype="text/event-stream")
+
+
+# =========================
+# Arranque
+# =========================
 def obtener_imagenes_galeria():
+    """Prueba rápida de acceso a galería (logs)."""
     global TOKEN
     if not TOKEN:
         if not obtener_nuevo_token():
@@ -924,8 +1050,8 @@ def obtener_imagenes_galeria():
         print("Haciendo llamada a la API de la galería...")
         response = requests.get(gallery_url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        print("Respuesta de la API de la galería:")
+        _ = response.json()
+        print("Respuesta OK a la API de la galería")
     except requests.exceptions.HTTPError as e:
         print(f"Error HTTP al obtener imágenes: {e.response.status_code} - {e.response.text}")
     except requests.exceptions.RequestException as e:
@@ -933,6 +1059,13 @@ def obtener_imagenes_galeria():
     except Exception as e:
         print(f"Ocurrió un error inesperado: {e}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     obtener_imagenes_galeria()
-    app.run(debug=True)
+    # Lanzar hilo de ingesta
+    t = threading.Thread(target=background_worker, daemon=True)
+    t.start()
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    finally:
+        _stop_event.set()
